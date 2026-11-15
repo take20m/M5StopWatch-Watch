@@ -173,6 +173,22 @@ RtcWakeupResult RtcWakeup::set_known_time(const std::tm& baseline)
     return verify_time(baseline);
 }
 
+RtcWakeupResult RtcWakeup::set_time(const std::tm& time)
+{
+    if (!initialized_) return {ESP_ERR_INVALID_STATE, ESP_ERR_INVALID_STATE};
+    if (!valid_calendar(time)) return {ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_ARG};
+    if (!rtc_.begin(bus_, kRx8130Address)) return {ESP_FAIL, ESP_FAIL};
+    std::tm copy = time;
+    rtc_.setTime(&copy);
+    std::tm actual = {};
+    const RtcWakeupResult result = read_time(&actual);
+    if (!result.ok()) return result;
+    const bool same_minute = actual.tm_year == time.tm_year && actual.tm_mon == time.tm_mon &&
+                             actual.tm_mday == time.tm_mday && actual.tm_hour == time.tm_hour &&
+                             actual.tm_min == time.tm_min;
+    return same_minute ? RtcWakeupResult{} : RtcWakeupResult{ESP_ERR_INVALID_RESPONSE, ESP_ERR_INVALID_RESPONSE};
+}
+
 RtcWakeupResult RtcWakeup::read_time(std::tm* time) const
 {
     if (time == nullptr) return {ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_ARG};

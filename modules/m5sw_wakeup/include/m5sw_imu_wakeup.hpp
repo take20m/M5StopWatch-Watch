@@ -11,11 +11,14 @@ namespace m5sw::wakeup {
 enum class ImuWakeProfile : std::uint8_t {
     low_power,
     reference,
+    // Accelerometer 50 Hz (power optimized) with only wrist-wear wake-up mapped to INT1.
+    wrist_wear,
 };
 
 struct ImuStatus {
     std::uint16_t raw = 0;
     bool any_motion   = false;
+    bool wrist_wear   = false;
 };
 
 struct ImuWakeupResult {
@@ -49,8 +52,19 @@ public:
     [[nodiscard]] ImuWakeupResult clear_status();
     // Disables configured sensors and INT1, leaving the adapter disarmed.
     [[nodiscard]] ImuWakeupResult disable();
+    // Gives direct access to the BMI270 driver after begin() (nullptr before), e.g. to read accel samples.
+    [[nodiscard]] bool initialized() const
+    {
+        return initialized_;
+    }
+    [[nodiscard]] bmi270_tools* device()
+    {
+        return initialized_ ? &imu_ : nullptr;
+    }
 
 private:
+    [[nodiscard]] ImuWakeupResult configure_wrist_wear();
+
     bmi270_tools imu_;
     bool initialized_           = false;
     bool any_motion_configured_ = false;

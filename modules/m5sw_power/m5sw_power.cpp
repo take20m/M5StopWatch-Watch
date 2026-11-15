@@ -1,10 +1,13 @@
 #include "m5sw_power.hpp"
 
+#include <initializer_list>
+
 #include "driver/gpio.h"
 #include "driver/rtc_io.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "m5sw_board.hpp"
+#include "soc/rtc_io_reg.h"
 
 namespace m5sw::power {
 namespace {
@@ -221,7 +224,7 @@ PowerResult PowerController::configure_l2_wake(WakeSelection wake)
     return {};
 }
 
-PowerResult PowerController::prepare_l2(WakeSelection wake)
+PowerResult PowerController::prepare_l2(WakeSelection wake, bool keep_charging)
 {
     if (!initialized_) return {ESP_ERR_INVALID_STATE, M5PM1_ERR_NOT_INIT};
     l1_prepared_ = false;
@@ -276,8 +279,10 @@ PowerResult PowerController::prepare_l2(WakeSelection wake)
     i2c_bus_device_handle_t touch = i2c_bus_device_create(bus_, m5sw::board::kTouchAddress, 100000);
     if (touch == nullptr) return {ESP_ERR_NO_MEM, ESP_ERR_NO_MEM};
     vTaskDelay(pdMS_TO_TICKS(100));
-    const esp_err_t touch_result = i2c_bus_write_byte(touch, 0xE5, 0x03);
-    if (touch_result != ESP_OK) return {touch_result, touch_result};
+    if (!touch_wake_) {
+        const esp_err_t touch_result = i2c_bus_write_byte(touch, 0xE5, 0x03);
+        if (touch_result != ESP_OK) return {touch_result, touch_result};
+    }
 
     result = from_ioe1(ioe1_.stop_all_pwm());
     if (!result.ok()) return result;
@@ -286,7 +291,9 @@ PowerResult PowerController::prepare_l2(WakeSelection wake)
     constexpr std::uint8_t kL2PowerMask = M5PM1_PWR_CFG_CHG_EN | M5PM1_PWR_CFG_DCDC_EN | M5PM1_PWR_CFG_LDO_EN |
                                           M5PM1_PWR_CFG_BOOST_EN | M5PM1_PWR_CFG_LED_CTRL;
     constexpr std::uint8_t kL2PowerValue = M5PM1_PWR_CFG_DCDC_EN | M5PM1_PWR_CFG_LDO_EN;
-    result                               = from_pm1(pm1_.set_power_config(kL2PowerMask, kL2PowerValue));
+    const std::uint8_t l2_power_value =
+        keep_charging ? static_cast<std::uint8_t>(kL2PowerValue | M5PM1_PWR_CFG_CHG_EN) : kL2PowerValue;
+    result = from_pm1(pm1_.set_power_config(kL2PowerMask, l2_power_value));
     if (!result.ok()) return result;
     result = from_pm1(pm1_.set_watchdog_timeout(0));
     if (!result.ok()) return result;
@@ -354,6 +361,105 @@ PowerResult PowerController::enter_l2(WakeSelection wake, L2Pm1IdleSleep pm1_idl
     PowerResult result = finalize_l2_peripherals(pm1_idle_sleep);
     if (!result.ok()) return result;
     vTaskDelay(kL2IdleSleepDelay);
+    esp_deep_sleep_start();
+    return {ESP_FAIL, ESP_FAIL};
+}
+
+PowerResult PowerController::read_battery_mv(std::uint16_t* millivolts)
+{
+    if (!initialized_) return {ESP_ERR_INVALID_STATE, M5PM1_ERR_NOT_INIT};
+    return from_pm1(pm1_.read_battery_mv(millivolts));
+}
+
+namespace {
+constexpr std::uint32_t kTouchLatchBit = 1u << (RTC_GPIO_STATUS_INT_S + 13);  // GPIO13 = RTC GPIO13
+static_assert(m5sw::board::kTouchIrq == GPIO_NUM_13, "touch latch assumes GPIO13");
+
+void arm_touch_latch()
+{
+    REG_SET_FIELD(RTC_GPIO_PIN13_REG, RTC_GPIO_PIN13_INT_TYPE, 2);  // 立ち下がり
+    REG_CLR_BIT(RTC_GPIO_PIN13_REG, RTC_GPIO_PIN13_WAKEUP_ENABLE);
+    REG_WRITE(RTC_GPIO_STATUS_W1TC_REG, kTouchLatchBit);
+}
+
+bool touch_latched() { return (REG_READ(RTC_GPIO_STATUS_REG) & kTouchLatchBit) != 0; }
+}  // namespace
+
+bool PowerController::take_touch_latch()
+{
+    const bool seen = touch_latched();
+    REG_SET_FIELD(RTC_GPIO_PIN13_REG, RTC_GPIO_PIN13_INT_TYPE, 0);
+    REG_WRITE(RTC_GPIO_STATUS_W1TC_REG, kTouchLatchBit);
+    return seen;
+}
+
+PowerResult PowerController::enter_l2_quick(WakeSelection wake, std::uint64_t timer_fallback_us,
+                                            L2Pm1IdleSleep pm1_idle_sleep, std::uint64_t key_wake_mask)
+{
+    if (!initialized_) return {ESP_ERR_INVALID_STATE, M5PM1_ERR_NOT_INIT};
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    if (wake != WakeSelection::none) {
+        esp_err_t sleep_result = gpio_reset_pin(m5sw::board::kPm1Irq);
+        if (sleep_result != ESP_OK) return {sleep_result, sleep_result};
+        sleep_result = rtc_gpio_pulldown_dis(m5sw::board::kPm1Irq);
+        if (sleep_result != ESP_OK) return {sleep_result, sleep_result};
+        sleep_result = rtc_gpio_pullup_en(m5sw::board::kPm1Irq);
+        if (sleep_result != ESP_OK) return {sleep_result, sleep_result};
+        sleep_result = esp_sleep_enable_ext0_wakeup(m5sw::board::kPm1Irq, 0);
+        if (sleep_result != ESP_OK) return {sleep_result, sleep_result};
+    }
+    if (timer_fallback_us > 0) {
+        const esp_err_t timer_result = esp_sleep_enable_timer_wakeup(timer_fallback_us);
+        if (timer_result != ESP_OK) return {timer_result, timer_result};
+    }
+    // Keys selected in key_wake_mask stay as pulled-up RTC inputs and wake the ESP32 through ext1
+    // (any key low). The others are isolated as in prepare_l2().
+    for (const gpio_num_t key : {m5sw::board::kKey2, m5sw::board::kKey1}) {
+        if ((key_wake_mask & (1ULL << key)) == 0) {
+            rtc_gpio_isolate(key);
+            continue;
+        }
+        rtc_gpio_hold_dis(key);
+        esp_err_t key_result = rtc_gpio_init(key);
+        if (key_result == ESP_OK) key_result = rtc_gpio_set_direction(key, RTC_GPIO_MODE_INPUT_ONLY);
+        if (key_result == ESP_OK) key_result = rtc_gpio_pulldown_dis(key);
+        if (key_result == ESP_OK) key_result = rtc_gpio_pullup_en(key);
+        if (key_result != ESP_OK) return {key_result, key_result};
+    }
+    std::uint64_t ext1_mask = key_wake_mask;
+    if (touch_wake_) {
+        // タッチの割り込み（Low のパルス）でも起きる。
+        const gpio_num_t irq = m5sw::board::kTouchIrq;
+        rtc_gpio_hold_dis(irq);
+        esp_err_t irq_result = rtc_gpio_init(irq);
+        if (irq_result == ESP_OK) irq_result = rtc_gpio_set_direction(irq, RTC_GPIO_MODE_INPUT_ONLY);
+        if (irq_result == ESP_OK) irq_result = rtc_gpio_pulldown_dis(irq);
+        if (irq_result == ESP_OK) irq_result = rtc_gpio_pullup_en(irq);
+        if (irq_result != ESP_OK) return {irq_result, irq_result};
+        ext1_mask |= 1ULL << irq;
+        arm_touch_latch();
+    } else {
+        rtc_gpio_isolate(m5sw::board::kTouchIrq);
+    }
+    if (ext1_mask != 0) {
+        const esp_err_t ext1_result = esp_sleep_enable_ext1_wakeup_io(ext1_mask, ESP_EXT1_WAKEUP_ANY_LOW);
+        if (ext1_result != ESP_OK) return {ext1_result, ext1_result};
+    }
+
+    PowerResult result = begin_ioe1();
+    if (!result.ok()) return result;
+    result = finalize_l2_peripherals(pm1_idle_sleep);
+    if (!result.ok()) return result;
+    // 寝る前の 1 秒の待ちの間にタップされたら、すぐ起きるようにタイマーを 1ms にして寝る
+    // （記録は残るので、起きた側で take_touch_latch() がタップとして扱う）。
+    const TickType_t step = pdMS_TO_TICKS(10);
+    for (TickType_t waited = 0; waited < kL2IdleSleepDelay; waited += step) {
+        if (touch_wake_ && touch_latched()) {
+            esp_sleep_enable_timer_wakeup(1000);
+            break;
+        }
+        vTaskDelay(step);
+    }
     esp_deep_sleep_start();
     return {ESP_FAIL, ESP_FAIL};
 }

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 
+#include "M5GFX.h"
 #include "esp_err.h"
 #include "i2c_bus.h"
 
@@ -27,13 +28,23 @@ public:
     DisplayController& operator=(const DisplayController&) = delete;
 
     // Borrows the shared I2C bus and initializes IOE1, panel power, reset and QSPI.
-    [[nodiscard]] DisplayResult begin(i2c_bus_handle_t bus, std::uint32_t i2c_speed_hz = 100000);
+    [[nodiscard]] DisplayResult begin(i2c_bus_handle_t bus, std::uint32_t i2c_speed_hz = 100000, bool use_framebuffer = true);
     // Sets panel brightness from 0 to 100 percent and records the applied value.
     [[nodiscard]] DisplayResult set_brightness_percent(std::uint8_t percent);
     // Submits one full-screen white frame through the reference framebuffer path.
     [[nodiscard]] DisplayResult show_white_static();
     // Submits one stopwatch UI frame; callers schedule this at kNormalRefreshHz.
     [[nodiscard]] DisplayResult draw_normal_frame(std::uint32_t elapsed_seconds);
+    // Gives direct access to the M5GFX device for custom drawing (nullptr before begin()).
+    // The framebuffer pushes automatically at endWrite(); wrap a frame in startWrite()/endWrite().
+    [[nodiscard]] lgfx::LGFX_Device* device();
+    // Puts the panel to sleep, factory-resets IOE1 (L3B and panel reset return to high impedance,
+    // as in prepare_l2) and leaves the QSPI pins as plain inputs. The controller cannot be reused.
+    [[nodiscard]] DisplayResult power_off();
+    // 診断用: 電源は入れたまま SPI バスだけ手放す
+    void release_bus_keep_power();
+    // release_bus_keep_power の後で、電源（IOE1）を切ってピンを入力に戻す
+    [[nodiscard]] DisplayResult cut_power();
     // Runs one iteration of the reference Full Load random drawing loop.
     [[nodiscard]] DisplayResult draw_full_load_step();
 

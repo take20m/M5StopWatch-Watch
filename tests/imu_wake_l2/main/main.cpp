@@ -10,7 +10,7 @@
 #include "m5sw_wakeup.hpp"
 
 // Set to 1 for the full reference sensor load, or 0 for the low-power load.
-#define M5SW_IMU_WAKE_L2_REFERENCE_PROFILE 1
+#define M5SW_IMU_WAKE_L2_REFERENCE_PROFILE 0
 
 namespace {
 constexpr char kTag[]              = "imu_wake_l2";

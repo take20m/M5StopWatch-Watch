@@ -196,7 +196,7 @@ DisplayController::~DisplayController()
     }
 }
 
-DisplayResult DisplayController::begin(i2c_bus_handle_t bus, std::uint32_t i2c_speed_hz)
+DisplayResult DisplayController::begin(i2c_bus_handle_t bus, std::uint32_t i2c_speed_hz, bool use_framebuffer)
 {
     if (bus == nullptr || (i2c_speed_hz != 100000U && i2c_speed_hz != 400000U)) {
         return {ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_ARG};
@@ -255,6 +255,12 @@ DisplayResult DisplayController::begin(i2c_bus_handle_t bus, std::uint32_t i2c_s
         impl_->releaseBus();
         return rollback({ESP_FAIL, ESP_FAIL});
     }
+    if (!use_framebuffer) {
+        // 呼び出し側が自分で絵を送る場合（apps/watch）。フレームバッファの確保と黒塗りを省き、暗いままにする。
+        impl_->set_panel_brightness(0);
+        initialized_ = true;
+        return {};
+    }
     if (!impl_->enable_framebuffer()) {
         impl_->releaseBus();
         return rollback({ESP_FAIL, ESP_FAIL});
@@ -296,6 +302,45 @@ DisplayResult DisplayController::draw_normal_frame(std::uint32_t elapsed_seconds
                   static_cast<unsigned long>(minutes), static_cast<unsigned long>(seconds));
 
     impl_->draw_normal_frame(time_text);
+    return {};
+}
+
+lgfx::LGFX_Device* DisplayController::device()
+{
+    return initialized_ ? impl_ : nullptr;
+}
+
+void DisplayController::release_bus_keep_power()
+{
+    if (!initialized_) return;
+    impl_->releaseBus();
+    initialized_ = false;
+}
+
+DisplayResult DisplayController::power_off()
+{
+    if (!initialized_) return {ESP_ERR_INVALID_STATE, ESP_ERR_INVALID_STATE};
+    impl_->sleep();  // brightness 0 and panel sleep-in
+    vTaskDelay(pdMS_TO_TICKS(10));
+    impl_->releaseBus();
+    initialized_ = false;
+    return cut_power();
+}
+
+DisplayResult DisplayController::cut_power()
+{
+    if (impl_ == nullptr) return {ESP_ERR_INVALID_STATE, ESP_ERR_INVALID_STATE};
+    const auto reset = impl_->ioe1.factory_reset();
+    gpio_config_t pins  = {};
+    pins.pin_bit_mask   = (1ULL << kPanelCs) | (1ULL << kPanelClock) | (1ULL << kPanelData0) |
+                        (1ULL << kPanelData1) | (1ULL << kPanelData2) | (1ULL << kPanelData3) | (1ULL << kPanelTe);
+    pins.mode           = GPIO_MODE_INPUT;
+    pins.pull_up_en     = GPIO_PULLUP_DISABLE;
+    pins.pull_down_en   = GPIO_PULLDOWN_DISABLE;
+    pins.intr_type      = GPIO_INTR_DISABLE;
+    const esp_err_t gpio_result = gpio_config(&pins);
+    if (!reset.ok()) return from_ioe1(reset);
+    if (gpio_result != ESP_OK) return {gpio_result, gpio_result};
     return {};
 }
 

@@ -98,6 +98,7 @@ ImuWakeupResult ImuWakeup::read_retained_status(i2c_bus_handle_t bus, ImuStatus*
 
     status->raw        = static_cast<std::uint16_t>(data[0]) | (static_cast<std::uint16_t>(data[1]) << 8);
     status->any_motion = (status->raw & BMI270_ANY_MOT_STATUS_MASK) != 0U;
+    status->wrist_wear = (status->raw & BMI270_WRIST_WAKE_UP_STATUS_MASK) != 0U;
     return {};
 }
 
@@ -115,6 +116,7 @@ ImuWakeupResult ImuWakeup::begin(i2c_bus_handle_t bus)
 ImuWakeupResult ImuWakeup::configure_any_motion(ImuWakeProfile profile, std::uint8_t duration, std::uint8_t threshold)
 {
     if (!initialized_) return {ESP_ERR_INVALID_STATE, ESP_ERR_INVALID_STATE};
+    if (profile == ImuWakeProfile::wrist_wear) return configure_wrist_wear();
     if (profile == ImuWakeProfile::reference) {
         const ImuWakeupResult reference_result = configure_reference_sensor_load(&imu_);
         if (!reference_result.ok()) return reference_result;
@@ -155,6 +157,32 @@ ImuWakeupResult ImuWakeup::configure_any_motion(ImuWakeProfile profile, std::uin
     return {};
 }
 
+ImuWakeupResult ImuWakeup::configure_wrist_wear()
+{
+    // Same 50 Hz power-optimized accelerometer load as low_power; the gyroscope stays off.
+    ImuWakeupResult load_result = configure_low_power_sensor_load(&imu_);
+    if (!load_result.ok()) return load_result;
+
+    const bmi270_tools::sensor_type_t sensors[] = {
+        bmi270_tools::SENSOR_ACCEL,
+        static_cast<bmi270_tools::sensor_type_t>(BMI2_WRIST_WEAR_WAKE_UP),
+    };
+    esp_err_t result = imu_.enable_sensors(sensors, 2U);
+    if (result != ESP_OK) return {result, result};
+    load_result = verify_low_power_sensor_enable_state(&imu_);
+    if (!load_result.ok()) return load_result;
+
+    result = imu_.map_interrupt_to_pin(BMI2_WRIST_WEAR_WAKE_UP, bmi270_tools::INT_PIN_1);
+    if (result != ESP_OK) return {result, result};
+    // Same INT1 electrical setup as any-motion: active-high, push-pull, non-latched.
+    result = imu_.enable_interrupt(bmi270_tools::INT_PIN_1, true, false, false);
+    if (result != ESP_OK) return {result, result};
+    ESP_LOGI(kTag, "Wrist-wear wake-up mapped to INT1 (accel=50Hz power_optimized gyro=off)");
+    any_motion_configured_ = true;
+    profile_               = ImuWakeProfile::wrist_wear;
+    return {};
+}
+
 ImuWakeupResult ImuWakeup::read_status(ImuStatus* status) const
 {
     if (status == nullptr) return {ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_ARG};
@@ -166,6 +194,7 @@ ImuWakeupResult ImuWakeup::read_status(ImuStatus* status) const
     if (result != ESP_OK) return {result, result};
     status->raw        = static_cast<std::uint16_t>(data[0]) | (static_cast<std::uint16_t>(data[1]) << 8);
     status->any_motion = (status->raw & BMI270_ANY_MOT_STATUS_MASK) != 0U;
+    status->wrist_wear = (status->raw & BMI270_WRIST_WAKE_UP_STATUS_MASK) != 0U;
     return {};
 }
 
@@ -189,9 +218,15 @@ ImuWakeupResult ImuWakeup::disable()
         static_cast<bmi270_tools::sensor_type_t>(BMI2_WRIST_WEAR_WAKE_UP),
         static_cast<bmi270_tools::sensor_type_t>(BMI2_ANY_MOTION),
     };
-    const bool reference_configured            = any_motion_configured_ && profile_ == ImuWakeProfile::reference;
-    const bmi270_tools::sensor_type_t* sensors = reference_configured ? reference_sensors : low_power_sensors;
-    const std::uint8_t sensor_count            = reference_configured ? 4U : (any_motion_configured_ ? 2U : 1U);
+    const bmi270_tools::sensor_type_t wrist_sensors[] = {
+        bmi270_tools::SENSOR_ACCEL,
+        static_cast<bmi270_tools::sensor_type_t>(BMI2_WRIST_WEAR_WAKE_UP),
+    };
+    const bool reference_configured = any_motion_configured_ && profile_ == ImuWakeProfile::reference;
+    const bool wrist_configured     = any_motion_configured_ && profile_ == ImuWakeProfile::wrist_wear;
+    const bmi270_tools::sensor_type_t* sensors =
+        reference_configured ? reference_sensors : (wrist_configured ? wrist_sensors : low_power_sensors);
+    const std::uint8_t sensor_count = reference_configured ? 4U : (any_motion_configured_ ? 2U : 1U);
     const esp_err_t sensor_result              = imu_.disable_sensors(sensors, sensor_count);
     if (sensor_result != ESP_OK) return {sensor_result, sensor_result};
     const esp_err_t interrupt_result = imu_.disable_interrupt(bmi270_tools::INT_PIN_1);

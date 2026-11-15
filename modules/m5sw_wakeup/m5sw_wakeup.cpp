@@ -22,17 +22,26 @@ WakeupResult WakeController::from_imu(ImuWakeupResult result) const
     return {result.error, result.raw_error};
 }
 
-WakeupResult WakeController::begin(i2c_bus_handle_t bus)
+WakeupResult WakeController::begin(i2c_bus_handle_t bus, bool init_imu)
 {
     if (bus == nullptr) return {ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_ARG};
+    bus_                = bus;
     WakeupResult result = from_pm1(pm1_.begin(bus));
     if (!result.ok()) return result;
-    result       = from_imu(imu_.begin(bus));
+    if (init_imu) result = from_imu(imu_.begin(bus));
     initialized_ = result.ok();
     return result;
 }
 
-WakeupResult WakeController::select_source(WakeSelection selection, ImuWakeProfile imu_profile)
+WakeupResult WakeController::begin_imu()
+{
+    if (!initialized_) return {ESP_ERR_INVALID_STATE, ESP_ERR_INVALID_STATE};
+    if (imu_.initialized()) return {};
+    return from_imu(imu_.begin(bus_));
+}
+
+WakeupResult WakeController::select_source(WakeSelection selection, ImuWakeProfile imu_profile,
+                                           std::uint8_t any_duration, std::uint8_t any_threshold)
 {
     if (!initialized_) return {ESP_ERR_INVALID_STATE, ESP_ERR_INVALID_STATE};
 
@@ -49,7 +58,7 @@ WakeupResult WakeController::select_source(WakeSelection selection, ImuWakeProfi
         if (!result.ok()) return result;
     }
     if (selection == WakeSelection::imu || selection == WakeSelection::rtc_imu) {
-        result = from_imu(imu_.configure_any_motion(imu_profile));
+        result = from_imu(imu_.configure_any_motion(imu_profile, any_duration, any_threshold));
         if (!result.ok()) return result;
     } else if (selection == WakeSelection::port) {
         result = from_pm1(pm1_.configure_gpio_wake(m5sw::power::Pm1Gpio::port));
@@ -80,6 +89,7 @@ WakeupResult WakeController::capture(const RtcFlags& rtc_flags, const ImuStatus&
     if (!result.ok()) return from_pm1(result);
     snapshot->rtc_events     = rtc_flags.events();
     snapshot->imu_any_motion = imu_status.any_motion;
+    snapshot->imu_wrist_wear = imu_status.wrist_wear;
     // GPIO4 Port wake may be represented in either PM1's retained wake-source
     // mask or its GPIO IRQ status, depending on whether the edge was sampled
     // before or during the ESP32 wake path.
@@ -105,7 +115,10 @@ WakeupResult WakeController::clear_snapshot(const WakeSnapshot& snapshot)
     if (!result.ok()) return from_pm1(result);
     result = pm1_.clear_system_irq(snapshot.pm1_system_irq);
     if (!result.ok()) return from_pm1(result);
-    if (snapshot.imu_any_motion) return from_imu(imu_.clear_status());
+    // Without begin_imu(), INT_STATUS_0 was already consumed by read_retained_status() (clear-on-read).
+    if ((snapshot.imu_any_motion || snapshot.imu_wrist_wear) && imu_.initialized()) {
+        return from_imu(imu_.clear_status());
+    }
     return {};
 }
 

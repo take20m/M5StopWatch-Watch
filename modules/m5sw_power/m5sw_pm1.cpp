@@ -105,6 +105,14 @@ DriverResult Pm1Adapter::read_power_config(std::uint8_t* config)
     return result(pm1_.getPowerConfig(config));
 }
 
+DriverResult Pm1Adapter::read_battery_mv(std::uint16_t* millivolts)
+{
+    if (!initialized_ || millivolts == nullptr) {
+        return result(millivolts == nullptr ? M5PM1_ERR_INVALID_ARG : M5PM1_ERR_NOT_INIT);
+    }
+    return result(pm1_.readVbat(millivolts));
+}
+
 DriverResult Pm1Adapter::verify_mask(std::uint8_t mask, std::uint8_t expected)
 {
     std::uint8_t actual     = 0;

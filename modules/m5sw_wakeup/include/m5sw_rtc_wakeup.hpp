@@ -74,6 +74,8 @@ public:
     // The baseline must be a valid UTC-like calendar value with tm_sec == 0.
     // The driver stores calendar fields only; timezone conversion is out of scope.
     [[nodiscard]] RtcWakeupResult set_known_time(const std::tm& baseline);
+    // Sets the calendar to any valid time (seconds included) and checks that it reads back valid.
+    [[nodiscard]] RtcWakeupResult set_time(const std::tm& time);
     // Reads and validates the seven calendar registers without changing RTC state.
     [[nodiscard]] RtcWakeupResult read_time(std::tm* time) const;
 

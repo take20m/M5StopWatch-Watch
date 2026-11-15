@@ -50,6 +50,8 @@ public:
     [[nodiscard]] DriverResult disable_l1_rail_final();
     // Reads the complete PM1 power configuration without changing it.
     [[nodiscard]] DriverResult read_power_config(std::uint8_t* config);
+    // Reads the battery voltage measured by PM1, in millivolts.
+    [[nodiscard]] DriverResult read_battery_mv(std::uint16_t* millivolts);
     // Changes the LDO hold state and confirms the hardware state by readback.
     [[nodiscard]] DriverResult set_ldo_hold(bool enabled);
     // Reads the current LDO hold state without changing it.

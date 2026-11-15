@@ -26,6 +26,7 @@ struct WakeSnapshot {
     std::uint8_t pm1_system_irq = 0;
     RtcEvent rtc_events         = RtcEvent::none;
     bool imu_any_motion         = false;
+    bool imu_wrist_wear         = false;
     bool port                   = false;
 
     // Reports the PM1 external-wake classification without exposing driver masks.
@@ -51,16 +52,25 @@ public:
     WakeController& operator=(const WakeController&) = delete;
 
     // Initializes PM1 and BMI270 adapters while borrowing the shared I2C bus.
-    [[nodiscard]] WakeupResult begin(i2c_bus_handle_t bus);
+    // init_imu=false skips the BMI270 soft reset/config load (about 1 s), keeping the feature
+    // configuration armed before deep sleep. Call begin_imu() later if the IMU must be reconfigured.
+    [[nodiscard]] WakeupResult begin(i2c_bus_handle_t bus, bool init_imu = true);
+    [[nodiscard]] WakeupResult begin_imu();
     // Clears all wake paths, then enables only the selected source combination.
     [[nodiscard]] WakeupResult select_source(WakeSelection selection,
-                                             ImuWakeProfile imu_profile = ImuWakeProfile::low_power);
+                                             ImuWakeProfile imu_profile = ImuWakeProfile::low_power,
+                                             std::uint8_t any_duration = 10, std::uint8_t any_threshold = 30);
     // Combines PM1, RTC and IMU snapshots without clearing any source flags.
     [[nodiscard]] WakeupResult capture(const RtcFlags& rtc_flags, const ImuStatus& imu_status, WakeSnapshot* snapshot);
     // Reads BMI270 interrupt status without clearing it.
     [[nodiscard]] WakeupResult read_imu_status(ImuStatus* status) const;
     // Clears exactly the sources captured in the snapshot and verifies each adapter.
     [[nodiscard]] WakeupResult clear_snapshot(const WakeSnapshot& snapshot);
+    // The BMI270 wake adapter, for callers that need extra sensor access after begin().
+    [[nodiscard]] ImuWakeup& imu()
+    {
+        return imu_;
+    }
 
 private:
     [[nodiscard]] WakeupResult from_pm1(m5sw::power::DriverResult result) const;
@@ -69,6 +79,7 @@ private:
     m5sw::power::Pm1Adapter pm1_;
     ImuWakeup imu_;
     bool initialized_ = false;
+    i2c_bus_handle_t bus_ = nullptr;
 };
 
 }  // namespace m5sw::wakeup

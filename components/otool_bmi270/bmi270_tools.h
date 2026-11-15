@@ -421,6 +421,12 @@ public:
 
     // BMI270 implementation note.
     i2c_bus_device_handle_t device() const;
+
+    /**
+     * @brief Exposes the Bosch API device structure for features the wrapper does not cover
+     *        (e.g. bmi2_set_remap_axes, wrist-wear wake-up parameters).
+     */
+    struct bmi2_dev *bmi2_device() { return &_bmi270_dev; }
     uint8_t address() const;
     bool is_initialized() const;
 
