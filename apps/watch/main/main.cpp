@@ -281,11 +281,16 @@ void hourly_tasks(m5sw::wakeup::RtcWakeup* rtc, m5sw::power::PowerController* po
         for (int i = 1; i < kBatteryRecords; ++i) s_battery[i - 1] = s_battery[i];
         s_battery[kBatteryRecords - 1] = rec;
     }
+    maybe_wifi_time_sync(rtc, false);
+}
+
+// 電池の記録を全部ログに出す（USB がつながっているときに毎回。電池の持ちを測るため）。
+void dump_battery_history()
+{
     for (int i = 0; i < s_battery_count; ++i) {
         ESP_LOGI(kTag, "BAT_HIST %d epoch=%lld mv=%u shows=%u wakes=%lu", i, static_cast<long long>(s_battery[i].epoch),
                  s_battery[i].mv, s_battery[i].shows, static_cast<unsigned long>(s_battery[i].wakes));
     }
-    maybe_wifi_time_sync(rtc, false);
 }
 
 // ---------------------------------------------------------------------------
@@ -1544,6 +1549,7 @@ extern "C" void app_main(void)
     }
 
     hourly_tasks(&rtc, &power);
+    if (usb_serial_jtag_is_connected()) dump_battery_history();
     wait_keys_released();
     ESP_LOGI(kTag, "SLEEP at %lldms", now_ms());
     vTaskDelay(kLogFlushWait);
