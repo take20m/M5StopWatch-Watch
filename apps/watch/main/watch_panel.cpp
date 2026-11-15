@@ -74,6 +74,19 @@ esp_err_t hold_usb_mux(i2c_bus_handle_t bus)
     return r.ok() ? ESP_OK : r.error;
 }
 
+esp_err_t set_vibration(i2c_bus_handle_t bus, bool on)
+{
+    if (bus == nullptr) return ESP_ERR_INVALID_ARG;
+    static bool ready = false;
+    if (!ready) {
+        const auto r = s_ioe1.begin(bus, 100000);
+        if (!r.ok()) return r.error;
+        ready = true;
+    }
+    const auto r = s_ioe1.set_pin(m5sw::board::IoePin::motor_pwm, on);
+    return r.ok() ? ESP_OK : r.error;
+}
+
 esp_err_t WatchPanel::open_bus()
 {
     // SPI（4 線）と esp_lcd

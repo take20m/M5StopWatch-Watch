@@ -49,4 +49,7 @@ void panel_power_lost();
 // USB の切替（CH442E）を ESP32 側に固定する。コールドブート時と、画面の電源を切った後に呼ぶ。
 esp_err_t hold_usb_mux(i2c_bus_handle_t bus);
 
+// 振動モーター（IOE1 の IO9）を回す／止める。タイマーが鳴ったときに使う。
+esp_err_t set_vibration(i2c_bus_handle_t bus, bool on);
+
 }  // namespace watch

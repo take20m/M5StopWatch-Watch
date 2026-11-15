@@ -24,6 +24,7 @@
 #include "driver/usb_serial_jtag_vfs.h"
 #include "esp_attr.h"
 #include "esp_log.h"
+#include "esp_rtc_time.h"
 #include "esp_rom_sys.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
@@ -644,6 +645,127 @@ CharacterSet character_set()
 #endif
 
 // ---------------------------------------------------------------------------
+// ストップウォッチとタイマー（寝ている間も進む。状態は RTC メモリに置く）
+// ボタン: KEYA（GPIO2）= 次の画面、KEYB（GPIO1）= スタート／ストップ、KEYB 長押し = リセット。
+// タイマーの画面でタップすると時間を変える。
+// ---------------------------------------------------------------------------
+enum class Screen : int { clock = 0, stopwatch = 1, timer = 2 };
+constexpr int kScreenCount             = 3;
+constexpr int kTimerPresetsS[]         = {60, 180, 300, 600, 900, 1800, 3600};
+constexpr int kTimerPresetCount        = sizeof(kTimerPresetsS) / sizeof(kTimerPresetsS[0]);
+constexpr std::int64_t kAppIdleBackS   = 120;       // 止まっているアプリは 2 分さわらなければ時計に戻す
+constexpr std::int64_t kAlarmUs        = 30000000;  // タイマーが鳴る長さ
+constexpr std::int64_t kLongPressMs    = 700;
+constexpr std::int64_t kAlarmEarlyUs   = 200000;    // この時間より残りが短ければ「時間になった」とみなす
+constexpr std::int64_t kNoEpoch        = INT64_MIN;
+
+struct AppState {
+    int screen                  = 0;
+    std::int64_t last_use_epoch = 0;
+    bool sw_running             = false;
+    std::int64_t sw_base_us     = 0;  // 止めるまでにたまった時間
+    std::int64_t sw_start_rc_us = 0;
+    std::int64_t sw_start_epoch = 0;
+    int tm_preset               = 1;  // 3 分
+    bool tm_running             = false;
+    std::int64_t tm_left_us     = 0;  // 一時停止中の残り（0 なら設定した時間から）
+    std::int64_t tm_end_rc_us   = 0;
+    std::int64_t tm_end_epoch   = 0;
+    bool tm_alarm               = false;
+};
+RTC_DATA_ATTR AppState s_app;
+
+// 寝ている間も進む ESP32 の RTC タイマー（内蔵の発振器なので少しずれる）。
+std::int64_t rc_now_us() { return static_cast<std::int64_t>(esp_rtc_get_time_us()); }
+
+// RTC タイマーで測った時間を、RX8130 の秒で測った時間の ±2 秒に収める（内蔵発振器のずれ対策）。
+std::int64_t checked_us(std::int64_t rc_us, std::int64_t rx_s, bool have_rx)
+{
+    if (!have_rx) return rc_us;
+    const std::int64_t lo = std::max<std::int64_t>(0, (rx_s - 2) * 1000000);
+    const std::int64_t hi = std::max<std::int64_t>(0, (rx_s + 2) * 1000000);
+    return std::min(std::max(rc_us, lo), hi);
+}
+
+std::int64_t timer_total_us() { return kTimerPresetsS[s_app.tm_preset % kTimerPresetCount] * 1000000LL; }
+
+std::int64_t stopwatch_us(std::int64_t epoch)
+{
+    if (!s_app.sw_running) return s_app.sw_base_us;
+    return s_app.sw_base_us + checked_us(rc_now_us() - s_app.sw_start_rc_us, epoch - s_app.sw_start_epoch,
+                                         epoch != kNoEpoch && s_app.sw_start_epoch != kNoEpoch);
+}
+
+std::int64_t timer_left_us(std::int64_t epoch)
+{
+    if (!s_app.tm_running) return s_app.tm_left_us > 0 ? s_app.tm_left_us : timer_total_us();
+    const std::int64_t rc_left = s_app.tm_end_rc_us - rc_now_us();
+    if (rc_left <= 0) return 0;
+    return checked_us(rc_left, s_app.tm_end_epoch - epoch, epoch != kNoEpoch && s_app.tm_end_epoch != kNoEpoch);
+}
+
+bool timer_due() { return s_app.tm_running && s_app.tm_end_rc_us - rc_now_us() <= kAlarmEarlyUs; }
+
+void stopwatch_toggle(std::int64_t epoch)
+{
+    if (s_app.sw_running) {
+        s_app.sw_base_us = stopwatch_us(epoch);
+        s_app.sw_running = false;
+    } else {
+        s_app.sw_start_rc_us = rc_now_us();
+        s_app.sw_start_epoch = epoch;
+        s_app.sw_running     = true;
+    }
+}
+
+void stopwatch_reset()
+{
+    s_app.sw_running = false;
+    s_app.sw_base_us = 0;
+}
+
+void timer_toggle(std::int64_t epoch)
+{
+    if (s_app.tm_running) {
+        s_app.tm_left_us = std::max<std::int64_t>(1, timer_left_us(epoch));
+        s_app.tm_running = false;
+    } else {
+        const std::int64_t left = timer_left_us(epoch);
+        s_app.tm_end_rc_us      = rc_now_us() + left;
+        s_app.tm_end_epoch      = epoch == kNoEpoch ? kNoEpoch : epoch + (left + 500000) / 1000000;
+        s_app.tm_running        = true;
+    }
+}
+
+void timer_reset()
+{
+    s_app.tm_running = false;
+    s_app.tm_left_us = 0;
+    s_app.tm_alarm   = false;
+}
+
+void timer_start_alarm()
+{
+    s_app.tm_running = false;
+    s_app.tm_left_us = 0;
+    s_app.tm_alarm   = true;
+    s_app.screen     = static_cast<int>(Screen::timer);
+}
+
+// 点けたときに出す画面。止まっているアプリをしばらく使っていなければ時計に戻す。
+Screen screen_for_show(std::int64_t epoch)
+{
+    if (s_app.tm_alarm) return Screen::timer;
+    Screen screen = static_cast<Screen>(s_app.screen % kScreenCount);
+    const bool running = (screen == Screen::stopwatch && s_app.sw_running) || (screen == Screen::timer && s_app.tm_running);
+    if (screen != Screen::clock && !running && epoch != kNoEpoch && epoch - s_app.last_use_epoch > kAppIdleBackS) {
+        screen = Screen::clock;
+    }
+    s_app.screen = static_cast<int>(screen);
+    return screen;
+}
+
+// ---------------------------------------------------------------------------
 // 文字盤
 // ---------------------------------------------------------------------------
 struct FaceData {
@@ -670,6 +792,10 @@ struct FaceState {
     char date[48]  = {};
     char hm[8]     = {};
     char sec[4]    = {};
+    // ストップウォッチ・タイマーの画面
+    char big[24]             = {};
+    char small[8]            = {};
+    std::uint16_t big_color  = 0;
 };
 
 // 文字の背景を、決まった大きさの枠で塗ってから描く（数字の幅が変わっても前の文字が残らないように）。
@@ -695,7 +821,8 @@ void draw_text_box(lgfx::LovyanGFX* gfx, const char* text, const char* widest, i
 }
 
 // 時刻（HH:MM）を、数字の幅をそろえて描く（Inter の数字は幅が少しずつ違うので、1 秒ごとに揺れないように）。
-void draw_time_digits(lgfx::LovyanGFX* gfx, const char* hm, int cx, int cy, DirtyRows* dirty)
+void draw_time_digits(lgfx::LovyanGFX* gfx, const char* hm, int cx, int cy, DirtyRows* dirty,
+                      std::uint16_t color = TFT_WHITE)
 {
     gfx->loadFont(kFontTime);
     int cell = 0;
@@ -704,7 +831,8 @@ void draw_time_digits(lgfx::LovyanGFX* gfx, const char* hm, int cx, int cy, Dirt
         cell = std::max(cell, static_cast<int>(gfx->textWidth(one)));
     }
     const int colon = gfx->textWidth(":");
-    const int total = cell * 4 + colon;
+    int total = 0;  // 桁数に合わせた幅（「1:05」のような 3 桁でも真ん中に来るように）
+    for (int i = 0; hm[i] != 0; ++i) total += hm[i] == ':' ? colon : cell;
     // 数字は下に伸びないので、ベースラインに合わせて描き、塗るのは数字の高さだけにする
     // （行全体の高さで塗ると、上の日付の下半分まで消えていた。2026-11-15 写真 IMG_0076）。
     // 数字の高さ（Inter のキャップハイトは約 0.73em。kFontTime は 120px なので 87px）。
@@ -712,9 +840,11 @@ void draw_time_digits(lgfx::LovyanGFX* gfx, const char* hm, int cx, int cy, Dirt
     // （2026-11-15 動画 IMG_0078）。
     constexpr int cap  = 120 * 73 / 100;
     const int baseline = cy + cap / 2;
-    gfx->fillRect(cx - total / 2 - 6, baseline - cap - 4, total + 12, cap + 10, TFT_BLACK);
+    // 塗るのはいつも「00:00」の幅以上にする（「1:00」のように短くなったとき、前の数字の端が残っていた。2026-11-15 写真 IMG_0084）
+    const int clear_w = std::max(total, cell * 4 + colon);
+    gfx->fillRect(cx - clear_w / 2 - 6, baseline - cap - 4, clear_w + 12, cap + 10, TFT_BLACK);
     dirty->add(baseline - cap - 4, baseline + 5);
-    gfx->setTextColor(TFT_WHITE);  // 背景は上で塗ってあるので、文字ごとの背景塗りはしない
+    gfx->setTextColor(color);  // 背景は上で塗ってあるので、文字ごとの背景塗りはしない
     gfx->setTextDatum(lgfx::textdatum_t::baseline_center);
     int x = cx - total / 2;
     for (int i = 0; hm[i] != 0; ++i) {
@@ -829,6 +959,62 @@ void draw_face(lgfx::LovyanGFX* gfx, const FaceData& data, FaceState* state, Dir
     gfx->unloadFont();
 }
 
+// ストップウォッチ・タイマーの画面。上に名前、真ん中に大きく時間、その下に 1/100 秒（または秒）、下に操作の説明。
+void draw_app(lgfx::LovyanGFX* gfx, Screen screen, std::int64_t us, bool running, bool alarm, bool alarm_phase,
+              FaceState* st, DirtyRows* dirty)
+{
+    const bool full = !st->drawn;
+    const bool sw   = screen == Screen::stopwatch;
+    if (full) {
+        gfx->fillScreen(TFT_BLACK);
+        st->drawn = true;
+        dirty->add(0, gfx->height() - 1);
+        gfx->loadFont(kFontSmall);
+        gfx->setTextDatum(lgfx::textdatum_t::middle_center);
+        gfx->setTextColor(kColorAccent);
+        gfx->drawString(sw ? "STOPWATCH" : (alarm ? "DONE" : "TIMER"), kCenterX, kDateY);
+        gfx->loadFont(kFontHint);
+        gfx->setTextColor(kColorDim);
+        if (alarm) {
+            gfx->drawString("PRESS ANY BUTTON", kCenterX, 335);
+        } else if (sw) {
+            gfx->drawString("B  START / STOP", kCenterX, 318);
+            gfx->drawString("HOLD B  RESET", kCenterX, 352);
+            gfx->drawString("A  NEXT", kCenterX, 386);
+        } else {
+            gfx->drawString("TAP  CHANGE TIME", kCenterX, 318);
+            gfx->drawString("B  START / STOP", kCenterX, 352);
+            gfx->drawString("HOLD B  RESET   A  NEXT", kCenterX, 386);
+        }
+    }
+    // タイマーは切り上げて表示する（残り 0.4 秒は 00:01）
+    const std::int64_t shown = sw ? us : (us + 999999) / 1000000 * 1000000;
+    const long long s        = std::min<long long>(shown / 1000000, 99 * 3600 + 3599);  // 99:59 まで
+    char big[24]             = {};
+    char small[8]            = {};
+    if (s >= 6000) {  // 100 分からは「時:分」と「:秒」にする（60 分のタイマーは 60:00 と出す）
+        std::snprintf(big, sizeof(big), "%lld:%02lld", s / 3600, (s / 60) % 60);
+        std::snprintf(small, sizeof(small), ":%02lld", s % 60);
+    } else {
+        std::snprintf(big, sizeof(big), "%02lld:%02lld", s / 60, s % 60);
+        if (sw) std::snprintf(small, sizeof(small), ".%02lld", static_cast<long long>((us / 10000) % 100));
+    }
+    const std::uint16_t color = alarm ? (alarm_phase ? kColorAccent : TFT_WHITE) : (running ? TFT_WHITE : kColorDate);
+    if (full || std::strcmp(big, st->big) != 0 || color != st->big_color) {
+        draw_time_digits(gfx, big, kCenterX, kTimeY, dirty, color);
+        std::strcpy(st->big, big);
+        st->big_color = color;
+    }
+    if (full || std::strcmp(small, st->small) != 0) {
+        gfx->loadFont(kFontSec);
+        gfx->setTextColor(kColorAccent);
+        gfx->setTextDatum(lgfx::textdatum_t::middle_center);
+        draw_text_box(gfx, small, ":88", kCenterX, kSecY, dirty);
+        std::strcpy(st->small, small);
+    }
+    gfx->unloadFont();
+}
+
 enum class ShowMode { look, button, cold_boot };
 
 // 画面はすべて専用タスク（コア 1）で扱う。電源オン・初期化・描画・消灯を同じタスクで行う
@@ -844,6 +1030,7 @@ struct DisplayJob {
     volatile DisplayCommand command     = DisplayCommand::none;
     volatile ShowMode mode              = ShowMode::look;
     volatile bool stop                  = false;  // メイン側が「腕を下ろした」と判断したら立てる
+    volatile bool interacted            = false;  // 表示中にボタンやタップで操作した（腕を下ろしても消さない）
     bool started                        = false;
     SemaphoreHandle_t done              = nullptr;
 };
@@ -878,8 +1065,26 @@ void display_task(void*)
         if (frame.time_valid) frame.epoch += (now_ms() - epoch_at_ms) / 1000;
         FaceState face_state;
         DirtyRows dirty;
+        auto epoch_now = [&]() -> std::int64_t {
+            return data.time_valid ? data.epoch + (now_ms() - epoch_at_ms) / 1000 : kNoEpoch;
+        };
+        if (timer_due()) timer_start_alarm();
+        Screen screen              = screen_for_show(epoch_now());
+        std::int64_t alarm_from_ms = now_ms();
+        bool alarm_phase           = true;
+        auto draw_current          = [&](DirtyRows* d) {
+            if (data.time_valid) frame.epoch = epoch_now();
+            if (screen == Screen::clock) {
+                draw_face(gfx, frame, &face_state, d);
+            } else if (screen == Screen::stopwatch) {
+                draw_app(gfx, screen, stopwatch_us(epoch_now()), s_app.sw_running, false, false, &face_state, d);
+            } else {
+                draw_app(gfx, screen, s_app.tm_alarm ? 0 : timer_left_us(epoch_now()), s_app.tm_running, s_app.tm_alarm,
+                         alarm_phase, &face_state, d);
+            }
+        };
         const std::int64_t t_draw0 = now_ms();
-        draw_face(gfx, frame, &face_state, &dirty);
+        draw_current(&dirty);
         const std::int64_t t_draw1 = now_ms();
         const esp_err_t pushed = panel.push_rows(dirty.y0, dirty.y1);
         const std::int64_t t_push = now_ms();
@@ -895,30 +1100,69 @@ void display_task(void*)
 
         const std::int64_t limit_us =
             mode == ShowMode::look ? kLookShowMaxUs : (mode == ShowMode::button ? kButtonShowUs : kColdBootShowUs);
-        std::int64_t deadline_us = esp_timer_get_time() + limit_us;
-        int last_sec             = static_cast<int>(frame.epoch % 60);
+        std::int64_t deadline_us = esp_timer_get_time() + (s_app.tm_alarm ? kAlarmUs : limit_us);
         const char* reason       = "timeout";
-        bool key_was_down        = any_key_down();
-        // 表示中にタップしたら、キャラクターの表情を次に変える（1 回のタップで割り込みが何度か来るので 400ms は無視）。
-        s_touch_edges = 0;
-        int touch_irqs = 0;
+        // キーは押した瞬間・離した瞬間・長押しを見る。点けたときに押されていたキー（起こしたキー）は、離すまで無視する。
+        const gpio_num_t key_a = m5sw::board::kKey1;  // KEYA（GPIO2）
+        const gpio_num_t key_b = m5sw::board::kKey2;  // KEYB（GPIO1）
+        bool a_was             = gpio_get_level(key_a) == 0;
+        bool b_was             = gpio_get_level(key_b) == 0;
+        bool a_ignore          = a_was;
+        bool b_long_done       = b_was;  // true の間は、離しても短押しとして扱わない
+        std::int64_t b_down_ms = 0;
+        bool vibrating         = false;
+        // 表示中にタップしたら、時計ではキャラクターの表情、タイマーでは時間を変える
+        // （1 回のタップで割り込みが何度か来るので 400ms は無視）。
+        s_touch_edges            = 0;
+        int touch_irqs           = 0;
         std::int64_t next_tap_ms = 0;
+        auto interacted          = [&]() {
+            deadline_us = std::max(deadline_us, esp_timer_get_time() + kButtonShowUs);
+            job.interacted       = true;
+            s_app.last_use_epoch = epoch_now();
+        };
+        auto go_screen = [&](Screen next) {
+            screen       = next;
+            s_app.screen = static_cast<int>(next);
+            face_state   = FaceState{};  // 全体を描き直す
+        };
+        auto stop_alarm = [&]() {
+            s_app.tm_alarm = false;
+            face_state     = FaceState{};
+            if (vibrating) {
+                (void)watch::set_vibration(job.bus, false);
+                vibrating = false;
+            }
+        };
+        auto start_alarm = [&]() {
+            timer_start_alarm();
+            go_screen(Screen::timer);
+            alarm_from_ms = now_ms();
+            deadline_us   = std::max(deadline_us, esp_timer_get_time() + kAlarmUs);
+            job.interacted = true;
+            ESP_LOGI(kTag, "TIMER_ALARM");
+        };
+        if (s_app.tm_alarm) ESP_LOGI(kTag, "TIMER_ALARM (on wake)");
         while (esp_timer_get_time() < deadline_us) {
-            if (job.stop) {
+            if (job.stop && !job.interacted && !s_app.tm_alarm) {
                 reason = "lowered";
                 break;
             }
-            if (data.time_valid) {
-                frame.epoch   = data.epoch + (now_ms() - epoch_at_ms) / 1000;
-                const int sec = static_cast<int>(frame.epoch % 60);
-                if (sec != last_sec) {
-                    last_sec = sec;
-                    DirtyRows changed;
-                    draw_face(gfx, frame, &face_state, &changed);
-                    if (!changed.empty()) {
-                        const esp_err_t e = panel.push_rows(changed.y0, changed.y1);
-                        if (e != ESP_OK) ESP_LOGW(kTag, "PUSH_FAIL error=%s", esp_err_to_name(e));
-                    }
+            if (s_app.tm_running && timer_left_us(epoch_now()) == 0) start_alarm();
+            if (s_app.tm_alarm) {
+                // 0.4 秒ごとに振動と色を切り替える
+                alarm_phase = ((now_ms() - alarm_from_ms) / 400) % 2 == 0;
+                if (alarm_phase != vibrating) {
+                    (void)watch::set_vibration(job.bus, alarm_phase);
+                    vibrating = alarm_phase;
+                }
+            }
+            {
+                DirtyRows changed;
+                draw_current(&changed);
+                if (!changed.empty()) {
+                    const esp_err_t e = panel.push_rows(changed.y0, changed.y1);
+                    if (e != ESP_OK) ESP_LOGW(kTag, "PUSH_FAIL error=%s", esp_err_to_name(e));
                 }
             }
             if (s_touch_edges != 0) {
@@ -926,7 +1170,62 @@ void display_task(void*)
                 s_touch_edges = 0;
                 if (now_ms() >= next_tap_ms) {
                     next_tap_ms = now_ms() + 400;
-                    deadline_us = std::max(deadline_us, esp_timer_get_time() + kButtonShowUs);  // 触っている間は消さない
+                    interacted();
+                    if (s_app.tm_alarm) {
+                        stop_alarm();
+                    } else if (screen == Screen::timer) {
+                        if (!s_app.tm_running) {
+                            s_app.tm_preset  = (s_app.tm_preset + 1) % kTimerPresetCount;
+                            s_app.tm_left_us = 0;
+                        }
+                    } else if (screen == Screen::clock) {
+#if WATCH_HAS_CHARACTER
+                        ++s_character_index;
+                        DirtyRows changed;
+                        draw_character(gfx, s_character_index, &changed);
+                        if (!changed.empty()) (void)panel.push_rows(changed.y0, changed.y1);
+#endif
+                    }
+                }
+            }
+            const bool a = gpio_get_level(key_a) == 0;
+            const bool b = gpio_get_level(key_b) == 0;
+            if (a != a_was || b != b_was) ESP_LOGI(kTag, "KEY a=%d b=%d screen=%d", a, b, static_cast<int>(screen));
+            // KEYA: 次の画面
+            if (a && !a_was && !a_ignore) {
+                interacted();
+                if (s_app.tm_alarm) {
+                    stop_alarm();
+                } else {
+                    go_screen(static_cast<Screen>((static_cast<int>(screen) + 1) % kScreenCount));
+                }
+            }
+            if (!a) a_ignore = false;
+            // KEYB: 短く押す = スタート／ストップ、長押し = リセット
+            if (b && !b_was) {
+                b_down_ms   = now_ms();
+                b_long_done = false;
+            }
+            if (b && !b_long_done && now_ms() - b_down_ms >= kLongPressMs) {
+                b_long_done = true;
+                interacted();
+                if (s_app.tm_alarm) {
+                    stop_alarm();
+                } else if (screen == Screen::stopwatch) {
+                    stopwatch_reset();
+                } else if (screen == Screen::timer) {
+                    timer_reset();
+                }
+            }
+            if (!b && b_was && !b_long_done) {
+                interacted();
+                if (s_app.tm_alarm) {
+                    stop_alarm();
+                } else if (screen == Screen::stopwatch) {
+                    stopwatch_toggle(epoch_now());
+                } else if (screen == Screen::timer) {
+                    timer_toggle(epoch_now());
+                } else {
 #if WATCH_HAS_CHARACTER
                     ++s_character_index;
                     DirtyRows changed;
@@ -935,16 +1234,12 @@ void display_task(void*)
 #endif
                 }
             }
-            // ボタンを押したら延長する。
-            const bool key_down = any_key_down();
-            if (key_down != key_was_down) {
-                ESP_LOGI(kTag, "KEY %s (a=%d b=%d)", key_down ? "down" : "up", gpio_get_level(m5sw::board::kKey1),
-                         gpio_get_level(m5sw::board::kKey2));
-            }
-            if (key_down && !key_was_down) deadline_us = esp_timer_get_time() + kButtonShowUs;
-            key_was_down = key_down;
-            vTaskDelay(pdMS_TO_TICKS(40));
+            a_was = a;
+            b_was = b;
+            vTaskDelay(pdMS_TO_TICKS(20));
         }
+        if (vibrating) (void)watch::set_vibration(job.bus, false);
+        if (s_app.tm_alarm) s_app.tm_alarm = false;  // 鳴り終わった
         const std::int64_t shown_ms = now_ms() - first_frame_ms;
         const esp_err_t off         = panel.sleep();
 #if WATCH_HAS_CHARACTER
@@ -995,7 +1290,7 @@ void show_watch(ImuFifo* fifo, ShowMode mode)
     int low_run   = 0;
     const std::int64_t shown_from_us = esp_timer_get_time();
     while (xSemaphoreTake(g_job.done, pdMS_TO_TICKS(40)) != pdTRUE) {
-        if (mode != ShowMode::look || g_job.stop) continue;
+        if (mode != ShowMode::look || g_job.stop || g_job.interacted) continue;
         const int added = fifo->pull();
         for (int i = added - 1; i >= 0; --i) {
             Accel a;
@@ -1072,6 +1367,7 @@ extern "C" void app_main(void)
     if (cold_boot) {
         s_wake_count = s_show_count = 0;
         s_awake_ms                  = 0;
+        s_app                       = AppState{};  // 書き込み直後などは RTC メモリに前の値が残っていることがある
         ESP_LOGI(kTag, "COLD_BOOT cause=%d reset_reason=%d", static_cast<int>(cause), static_cast<int>(esp_reset_reason()));
         {
             const esp_err_t mux = watch::hold_usb_mux(bus);
@@ -1080,6 +1376,13 @@ extern "C" void app_main(void)
         (void)sync_time_from_usb(&rtc);
         show_watch(&fifo, ShowMode::cold_boot);
         maybe_wifi_time_sync(&rtc, true);  // コールドブートでは毎回試す（表示の後。Wi-Fi の動作確認を兼ねる）
+    } else if (timer_due()) {
+        // タイマーの時間になった（寝る前に、終わる時刻でタイマー起床を仕掛けてある）
+        ++s_wake_count;
+        ++s_show_count;
+        timer_start_alarm();
+        ESP_LOGI(kTag, "WAKE #%lu timer_alarm cause=%d", static_cast<unsigned long>(s_wake_count), static_cast<int>(cause));
+        show_watch(&fifo, ShowMode::button);
     } else if ((ext1_status & (1ULL << m5sw::board::kTouchIrq)) != 0 || touch_latched) {
         // タップで起きた。手首の動き（タップの振動）で先に起きた場合や、寝る直前の待ちの間のタップも、記録から分かる。
         ++s_wake_count;
@@ -1141,7 +1444,9 @@ extern "C" void app_main(void)
     if (!rtc_result.ok()) fail("rtc_disable", rtc_result.error, rtc_result.raw_error);
 
     const bool tap_wake = !cold_boot && (touch_latched || (ext1_status & (1ULL << m5sw::board::kTouchIrq)) != 0);
-    if (cold_boot || (cause == ESP_SLEEP_WAKEUP_TIMER && !tap_wake)) {
+    // 1 時間ごとの見回りのときだけ、ボードを設定し直す（タップやタイマーのアラームで起きたときはしない）。
+    const bool fallback_timer_wake = cause == ESP_SLEEP_WAKEUP_TIMER && !tap_wake && !g_shown;
+    if (cold_boot || fallback_timer_wake) {
         // ボード全体を L2 用に整え、BMI270 の any-motion と FIFO を設定する（タイマー起床では設定し直して復旧を試みる）。
         wake_result = wake.begin_imu();
         if (!wake_result.ok()) fail("imu_begin", wake_result.error, wake_result.raw_error);
@@ -1165,7 +1470,14 @@ extern "C" void app_main(void)
     ESP_LOGI(kTag, "SLEEP at %lldms", now_ms());
     vTaskDelay(kLogFlushWait);
     if (!cold_boot) s_awake_ms += now_ms() + 1000;  // enter_l2_quick 内の 1 秒待ちも足す
-    power_result = power.enter_l2_quick(m5sw::power::WakeSelection::rtc_imu, kTimerFallbackUs,
+    // タイマーが動いていたら、終わる時刻に起きる（寝る前に 1 秒待つ分を引く）。
+    std::int64_t sleep_us = static_cast<std::int64_t>(kTimerFallbackUs);
+    if (s_app.tm_running) {
+        const std::int64_t left = s_app.tm_end_rc_us - rc_now_us() - 1000000;
+        sleep_us                = std::min(sleep_us, std::max<std::int64_t>(1000, left));
+        ESP_LOGI(kTag, "TIMER running, wake in %lldms", sleep_us / 1000);
+    }
+    power_result = power.enter_l2_quick(m5sw::power::WakeSelection::rtc_imu, static_cast<std::uint64_t>(sleep_us),
                                         m5sw::power::L2Pm1IdleSleep::enabled, kKeyWakeMask);
     fail("l2_returned", power_result.error, power_result.raw_error);
 }
