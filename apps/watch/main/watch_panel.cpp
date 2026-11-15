@@ -74,7 +74,7 @@ esp_err_t hold_usb_mux(i2c_bus_handle_t bus)
     return r.ok() ? ESP_OK : r.error;
 }
 
-esp_err_t set_vibration(i2c_bus_handle_t bus, bool on)
+esp_err_t set_ioe_pin(i2c_bus_handle_t bus, m5sw::board::IoePin pin, bool high)
 {
     if (bus == nullptr) return ESP_ERR_INVALID_ARG;
     static bool ready = false;
@@ -83,8 +83,13 @@ esp_err_t set_vibration(i2c_bus_handle_t bus, bool on)
         if (!r.ok()) return r.error;
         ready = true;
     }
-    const auto r = s_ioe1.set_pin(m5sw::board::IoePin::motor_pwm, on);
+    const auto r = s_ioe1.set_pin(pin, high);
     return r.ok() ? ESP_OK : r.error;
+}
+
+esp_err_t set_vibration(i2c_bus_handle_t bus, bool on)
+{
+    return set_ioe_pin(bus, m5sw::board::IoePin::motor_pwm, on);
 }
 
 esp_err_t WatchPanel::open_bus()

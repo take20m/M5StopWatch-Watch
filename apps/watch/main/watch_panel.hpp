@@ -6,6 +6,8 @@
 // 転送を実績のある esp_lcd に置き換えて、M5GFX は画像を作るだけにする。
 #pragma once
 
+#include "m5sw_board.hpp"
+
 #include <cstdint>
 
 #include "M5GFX.h"
@@ -51,5 +53,8 @@ esp_err_t hold_usb_mux(i2c_bus_handle_t bus);
 
 // 振動モーター（IOE1 の IO9）を回す／止める。タイマーが鳴ったときに使う。
 esp_err_t set_vibration(i2c_bus_handle_t bus, bool on);
+
+// IOE1 のピンを High / Low にする（音声チップやスピーカーの電源など）。
+esp_err_t set_ioe_pin(i2c_bus_handle_t bus, m5sw::board::IoePin pin, bool high);
 
 }  // namespace watch

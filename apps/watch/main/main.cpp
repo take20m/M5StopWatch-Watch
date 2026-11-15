@@ -24,6 +24,7 @@
 #include "driver/usb_serial_jtag_vfs.h"
 #include "esp_attr.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_rtc_time.h"
 #include "esp_rom_sys.h"
 #include "esp_sleep.h"
@@ -35,6 +36,7 @@
 #include "i2c_bus.h"
 #include "m5sw_board.hpp"
 #include "time_sync.hpp"
+#include "watch_audio.hpp"
 #include "watch_fonts.h"
 #include "watch_panel.hpp"
 #include "m5sw_power.hpp"
@@ -55,6 +57,7 @@ constexpr std::uint64_t kTimerFallbackUs = 3600ULL * 1000 * 1000;  // 1 時間�
 constexpr std::uint64_t kKeyWakeMask     = (1ULL << m5sw::board::kKey1) | (1ULL << m5sw::board::kKey2);
 
 // ---- 画面 ----
+constexpr bool kTapSound               = false;  // タップで音を鳴らす（音はユーザーが用意するまで止めておく。2026-11-15）
 constexpr std::uint8_t kBrightness      = 60;        // %
 constexpr std::int64_t kLookShowMaxUs   = 10000000;  // 見続けていても 10 秒で消す
 constexpr std::int64_t kLookMinShowUs   = 3000000;   // 手首で点けたら、腕を下ろしてもこの時間は消さない
@@ -623,7 +626,7 @@ void wait_keys_released()
 #if WATCH_HAS_CHARACTER
 extern const std::uint8_t character_bin_start[] asm("_binary_character_bin_start");
 
-RTC_DATA_ATTR int s_character_index = 0;  // 今の表情。点けるたび・タップするたびに次へ
+RTC_DATA_ATTR int s_character_index = 0;  // 今の表情（画像の番号）
 
 struct CharacterSet {
     int count = 0, w = 0, h = 0;
@@ -856,15 +859,72 @@ void draw_time_digits(lgfx::LovyanGFX* gfx, const char* hm, int cx, int cy, Dirt
 }
 
 #if WATCH_HAS_CHARACTER
-// キャラクターを下に描く（背景の黒と混ぜ済みの RGB565 をそのまま貼る）。
-void draw_character(lgfx::LovyanGFX* gfx, int index, DirtyRows* dirty)
+// 時間帯ごとの表情（すもっぴの絵文字 40 個 + FIGHT の並び。番号は 0 から）。並びが違う画像なら順番に出す。
+constexpr int kCharacterSetSize = 41;
+constexpr int kFacesNight[]     = {32, 31, 15};                     // 0〜5 時: 寝ている
+constexpr int kFacesMorning[]   = {4, 40, 35, 21};                  // 6〜9 時: キラキラ、FIGHT、応援、手を振る
+constexpr int kFacesLunch[]     = {20};                             // 12 時: ごはん
+constexpr int kFacesDay[]       = {0, 1, 18, 21, 30, 28, 34, 3, 6}; // 10〜17 時
+constexpr int kFacesEvening[]   = {19, 38, 39, 6, 1};               // 18〜20 時: ハート
+constexpr int kFacesLate[]      = {25, 31, 33, 32};                 // 21〜23 時: ため息、ごろごろ
+
+template <std::size_t N>
+int pick_from(const int (&faces)[N], int current)
+{
+    std::size_t i = esp_random() % N;
+    if (N > 1 && faces[i] == current) i = (i + 1) % N;  // 同じ表情が続かないように
+    return faces[i];
+}
+
+// 点けたときの表情を時間帯で選ぶ。
+int character_for_hour(int hour, int current)
+{
+    const CharacterSet c = character_set();
+    if (c.count != kCharacterSetSize) return c.count > 0 ? (current + 1) % c.count : 0;
+    if (hour < 6) return pick_from(kFacesNight, current);
+    if (hour < 10) return pick_from(kFacesMorning, current);
+    if (hour == 12) return pick_from(kFacesLunch, current);
+    if (hour < 18) return pick_from(kFacesDay, current);
+    if (hour < 21) return pick_from(kFacesEvening, current);
+    return pick_from(kFacesLate, current);
+}
+
+// タップしたときは、全部の中からほかの表情にする。
+int character_any(int current)
+{
+    const CharacterSet c = character_set();
+    if (c.count <= 1) return 0;
+    return (current + 1 + static_cast<int>(esp_random() % (c.count - 1))) % c.count;
+}
+
+constexpr int kCharacterTopLimit = 262;  // これより上（秒の数字）には描かない
+constexpr int kCharacterMaxRise  = 18;   // 跳ねたときに上がる最大の量
+
+// キャラクターを下に描く（背景の黒と混ぜ済みの RGB565 をそのまま貼る）。offset_y が負なら上にずらす。
+void draw_character(lgfx::LovyanGFX* gfx, int index, DirtyRows* dirty, int offset_y = 0)
 {
     const CharacterSet c = character_set();
     if (c.count == 0) return;
     index %= c.count;
     const std::uint16_t* frame = c.frames + static_cast<std::size_t>(index) * c.w * c.h;
-    gfx->pushImage(kCenterX - c.w / 2, kCharacterY, c.w, c.h, reinterpret_cast<const lgfx::rgb565_t*>(frame));
-    dirty->add(kCharacterY, kCharacterY + c.h - 1);
+    const int band_top         = kCharacterTopLimit;
+    const int band_bottom      = kCharacterY + c.h + 4;
+    gfx->setClipRect(0, band_top, gfx->width(), band_bottom - band_top);
+    gfx->fillRect(kCenterX - c.w / 2 - 2, band_top, c.w + 4, band_bottom - band_top, TFT_BLACK);
+    gfx->pushImage(kCenterX - c.w / 2, kCharacterY + offset_y, c.w, c.h, reinterpret_cast<const lgfx::rgb565_t*>(frame));
+    gfx->clearClipRect();
+    dirty->add(band_top, band_bottom - 1);
+}
+
+// ゆっくり上下にゆれる（±3px、1.8 秒周期）。タップした直後は 0.36 秒で 1 回跳ねる。
+int character_offset(std::int64_t t_ms, std::int64_t jump_from_ms)
+{
+    int offset = static_cast<int>(std::lround(3.0 * std::sin(2.0 * M_PI * static_cast<double>(t_ms % 1800) / 1800.0)));
+    const std::int64_t j = t_ms - jump_from_ms;
+    if (jump_from_ms > 0 && j >= 0 && j < 360) {
+        offset -= static_cast<int>(std::lround(kCharacterMaxRise * std::sin(M_PI * static_cast<double>(j) / 360.0)));
+    }
+    return offset;
 }
 #endif
 
@@ -1070,6 +1130,14 @@ void display_task(void*)
         };
         if (timer_due()) timer_start_alarm();
         Screen screen              = screen_for_show(epoch_now());
+#if WATCH_HAS_CHARACTER
+        {
+            const int hour = data.time_valid ? utc_from_epoch(epoch_now() + kJstOffsetSec).tm_hour : 12;
+            s_character_index = character_for_hour(hour, s_character_index);
+        }
+        std::int64_t jump_from_ms = 0;
+        int char_offset           = 0;
+#endif
         std::int64_t alarm_from_ms = now_ms();
         bool alarm_phase           = true;
         auto draw_current          = [&](DirtyRows* d) {
@@ -1159,7 +1227,19 @@ void display_task(void*)
             }
             {
                 DirtyRows changed;
+#if WATCH_HAS_CHARACTER
+                if (!face_state.drawn) char_offset = 0;  // 全体を描き直すときは、ずらさずに描かれる
+#endif
                 draw_current(&changed);
+#if WATCH_HAS_CHARACTER
+                if (screen == Screen::clock) {
+                    const int offset = character_offset(now_ms(), jump_from_ms);
+                    if (offset != char_offset) {
+                        draw_character(gfx, s_character_index, &changed, offset);
+                        char_offset = offset;
+                    }
+                }
+#endif
                 if (!changed.empty()) {
                     const esp_err_t e = panel.push_rows(changed.y0, changed.y1);
                     if (e != ESP_OK) ESP_LOGW(kTag, "PUSH_FAIL error=%s", esp_err_to_name(e));
@@ -1180,10 +1260,10 @@ void display_task(void*)
                         }
                     } else if (screen == Screen::clock) {
 #if WATCH_HAS_CHARACTER
-                        ++s_character_index;
-                        DirtyRows changed;
-                        draw_character(gfx, s_character_index, &changed);
-                        if (!changed.empty()) (void)panel.push_rows(changed.y0, changed.y1);
+                        s_character_index = character_any(s_character_index);
+                        jump_from_ms      = now_ms();
+                        char_offset       = INT32_MIN;  // 描き直す
+                        if (kTapSound) watch::audio_play(job.bus, watch::Sound::tap);
 #endif
                     }
                 }
@@ -1227,10 +1307,10 @@ void display_task(void*)
                     timer_toggle(epoch_now());
                 } else {
 #if WATCH_HAS_CHARACTER
-                    ++s_character_index;
-                    DirtyRows changed;
-                    draw_character(gfx, s_character_index, &changed);
-                    if (!changed.empty()) (void)panel.push_rows(changed.y0, changed.y1);
+                    s_character_index = character_any(s_character_index);
+                    jump_from_ms      = now_ms();
+                    char_offset       = INT32_MIN;
+                    if (kTapSound) watch::audio_play(job.bus, watch::Sound::tap);
 #endif
                 }
             }
@@ -1239,12 +1319,10 @@ void display_task(void*)
             vTaskDelay(pdMS_TO_TICKS(20));
         }
         if (vibrating) (void)watch::set_vibration(job.bus, false);
+        watch::audio_shutdown();
         if (s_app.tm_alarm) s_app.tm_alarm = false;  // 鳴り終わった
         const std::int64_t shown_ms = now_ms() - first_frame_ms;
         const esp_err_t off         = panel.sleep();
-#if WATCH_HAS_CHARACTER
-        ++s_character_index;  // 次に点けたときは別の表情
-#endif
         ESP_LOGI(kTag, "HIDE after %lldms (%s) power_off=%s touch_irq_samples=%d", shown_ms, reason,
                  esp_err_to_name(off), touch_irqs);
     } else {
