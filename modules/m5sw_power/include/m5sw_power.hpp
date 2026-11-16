@@ -94,6 +94,11 @@ public:
     [[nodiscard]] PowerResult read_battery_mv(std::uint16_t* millivolts);
     // USB（5VIN）の電圧。挿していなければ 0 付近。
     [[nodiscard]] PowerResult read_vin_mv(std::uint16_t* millivolts);
+    // begin() 済みの PM1 アダプタ。起床判定側と共有して、PM1 の初期化を 1 回にする。
+    [[nodiscard]] Pm1Adapter& pm1_adapter()
+    {
+        return pm1_;
+    }
 
 private:
     [[nodiscard]] PowerResult from_pm1(DriverResult result) const;

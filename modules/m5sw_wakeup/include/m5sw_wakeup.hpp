@@ -55,6 +55,8 @@ public:
     // init_imu=false skips the BMI270 soft reset/config load (about 1 s), keeping the feature
     // configuration armed before deep sleep. Call begin_imu() later if the IMU must be reconfigured.
     [[nodiscard]] WakeupResult begin(i2c_bus_handle_t bus, bool init_imu = true);
+    // shared_pm1 を渡すと、begin() 済みのそのアダプタを使い、PM1 をもう一度初期化しない。
+    [[nodiscard]] WakeupResult begin(i2c_bus_handle_t bus, bool init_imu, m5sw::power::Pm1Adapter* shared_pm1);
     [[nodiscard]] WakeupResult begin_imu();
     // Clears all wake paths, then enables only the selected source combination.
     [[nodiscard]] WakeupResult select_source(WakeSelection selection,
@@ -76,7 +78,13 @@ private:
     [[nodiscard]] WakeupResult from_pm1(m5sw::power::DriverResult result) const;
     [[nodiscard]] WakeupResult from_imu(ImuWakeupResult result) const;
 
+    [[nodiscard]] m5sw::power::Pm1Adapter& pm1()
+    {
+        return shared_pm1_ != nullptr ? *shared_pm1_ : pm1_;
+    }
+
     m5sw::power::Pm1Adapter pm1_;
+    m5sw::power::Pm1Adapter* shared_pm1_ = nullptr;
     ImuWakeup imu_;
     bool initialized_ = false;
     i2c_bus_handle_t bus_ = nullptr;

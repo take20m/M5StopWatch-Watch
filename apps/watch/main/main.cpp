@@ -181,7 +181,7 @@ auto with_retry(Fn fn)
     auto result = fn();
     for (int attempt = 1; attempt < 4 && !result.ok(); ++attempt) {
         ESP_LOGW(kTag, "I2C_RETRY attempt=%d error=%s", attempt, esp_err_to_name(result.error));
-        vTaskDelay(pdMS_TO_TICKS(20));
+        vTaskDelay(pdMS_TO_TICKS(10));  // PM1 は起こしてから 10ms で応える
         result = fn();
     }
     return result;
@@ -195,6 +195,28 @@ std::int64_t now_ms()
 // ---------------------------------------------------------------------------
 // 省電力: CPU の速さ・浅い眠り（light sleep）・ログ
 // ---------------------------------------------------------------------------
+// 起きてから寝るまでの各段階の時刻（USB のときにまとめて出す。どこで時間を使っているかを見る）
+struct Mark {
+    const char* name;
+    std::int32_t ms;
+};
+Mark s_marks[20];
+int s_mark_count = 0;
+void mark(const char* name)
+{
+    if (s_mark_count < 20) s_marks[s_mark_count++] = {name, static_cast<std::int32_t>(now_ms())};
+}
+void print_marks()
+{
+    char line[400];
+    int n = 0;
+    for (int i = 0; i < s_mark_count && n < static_cast<int>(sizeof(line)) - 24; ++i) {
+        n += snprintf(line + n, sizeof(line) - n, " %s=%ld", s_marks[i].name, static_cast<long>(s_marks[i].ms));
+    }
+    line[n] = 0;
+    ESP_LOGI(kTag, "TIMELINE%s", line);
+}
+
 bool s_usb_power = false;  // USB が挿さっている（ログを出し、浅い眠りは使わない。USB が切れるため）
 
 // 何もしていない間は CPU を kCpuMhzMin に落とし、light_sleep なら浅く眠らせる。
@@ -222,9 +244,12 @@ void keep_pins_in_light_sleep()
 // USB が挿さっていないときはログを出さない（UART への書き出しで起きている時間が延びる）。
 void apply_log_levels(bool usb)
 {
-    esp_log_level_set("*", usb ? ESP_LOG_INFO : ESP_LOG_ERROR);  // "*" は個別の設定を消すので先に呼ぶ
+    // USB なしでは何も出さない。ログは UART と USB に出るので、1 行ごとに数 ms〜50ms 待たされる
+    // （寝起き直後は USB の再接続前で 50ms の送信待ちになる）。異常停止の表示はこの設定と関係なく出る。
+    esp_log_level_set("*", usb ? ESP_LOG_INFO : ESP_LOG_NONE);  // "*" は個別の設定を消すので先に呼ぶ
     if (!usb) return;
     esp_log_level_set("i2c_bus", ESP_LOG_ERROR);
+    esp_log_level_set("pm", ESP_LOG_WARN);  // CPU 設定のたびの表示で、USB のときだけ計測が遅く見えるのを防ぐ
     esp_log_level_set("M5IOE1_I2C", ESP_LOG_WARN);
     esp_log_level_set("M5IOE1_GPIO", ESP_LOG_WARN);
     esp_log_level_set("M5IOE1_SYS", ESP_LOG_WARN);
@@ -329,10 +354,11 @@ void maybe_wifi_time_sync(m5sw::wakeup::RtcWakeup* rtc, bool force)
 void battery_append(const BatteryRecord& rec);
 
 // 1 時間ごとの用事。起きた理由によらず、前回から 1 時間たっていればする（腕を動かしている間は定期起床が来ないため）。
-void hourly_tasks(m5sw::wakeup::RtcWakeup* rtc, m5sw::power::PowerController* power)
+// 読んだ時刻（UNIX 秒）を返す。読めなければ 0。呼び出し側は夜の判定にも使う（RTC を 2 回読まない）。
+std::int64_t hourly_tasks(m5sw::wakeup::RtcWakeup* rtc, m5sw::power::PowerController* power)
 {
     std::tm utc = {};
-    if (!rtc->read_time(&utc).ok()) return;
+    if (!rtc->read_time(&utc).ok()) return 0;
     const std::int64_t now = epoch_from_utc(utc);
     if (s_next_record_epoch == 0 || now >= s_next_record_epoch) {
         s_next_record_epoch = now + kRecordEveryS;
@@ -349,9 +375,10 @@ void hourly_tasks(m5sw::wakeup::RtcWakeup* rtc, m5sw::power::PowerController* po
         rec.shown_cs      = static_cast<std::uint32_t>(s_shown_ms / 10);
         battery_append(rec);
     }
-    if (s_next_hourly_epoch != 0 && now < s_next_hourly_epoch) return;
+    if (s_next_hourly_epoch != 0 && now < s_next_hourly_epoch) return now;
     s_next_hourly_epoch = now + 3600;
     maybe_wifi_time_sync(rtc, false);
+    return now;
 }
 
 // 電池の記録はフラッシュ（NVS）にも残す。電池が切れると RTC メモリは消えるため。
@@ -1516,8 +1543,10 @@ extern "C" void app_main(void)
     bool false_wake                 = false;
     // 寝ている間〜ここまでのタップの記録（GPIO13 を設定し直す前に読む）
     const bool touch_latched = m5sw::power::PowerController::take_touch_latch();
+    mark("app");
     m5sw::test_support::TestContext context = {};
     ESP_ERROR_CHECK(m5sw::test_support::initialize(&context));
+    mark("init");
     apply_log_levels(false);  // USB かどうかは PM1 を読むまで分からない
     keep_pins_in_light_sleep();
 
@@ -1531,16 +1560,19 @@ extern "C" void app_main(void)
     // ボタンで起きたかの手がかり（ext1 の状態と、いま押されているか）。ext0（手首）と同時だと原因は ext0 と報告される。
     const std::uint64_t ext1_status = esp_sleep_get_ext1_wakeup_status();
     const bool key_at_boot          = any_key_down();
+    mark("keys");
 
     const esp_err_t i2c_result = m5sw::board::initialize_i2c();
     if (i2c_result != ESP_OK) fail("i2c", i2c_result, i2c_result);
     i2c_bus_handle_t bus         = nullptr;
     const esp_err_t claim_result = m5sw::board::acquire_i2c(&bus);
     if (claim_result != ESP_OK) fail("shared_bus", claim_result, claim_result);
+    mark("i2c");
 
     static m5sw::wakeup::RtcWakeup rtc;
     auto rtc_result = rtc.begin(bus);
     if (!rtc_result.ok()) fail("rtc_begin", rtc_result.error, rtc_result.raw_error);
+    mark("rtc");
     m5sw::wakeup::RtcFlags retained_rtc;
     rtc_result = rtc.read_flags(&retained_rtc);
     if (!rtc_result.ok()) fail("rtc_flags", rtc_result.error, rtc_result.raw_error);
@@ -1548,18 +1580,23 @@ extern "C" void app_main(void)
     m5sw::wakeup::ImuStatus retained_imu;
     auto imu_result = m5sw::wakeup::ImuWakeup::read_retained_status(bus, &retained_imu);
     if (!imu_result.ok()) fail("imu_retained", imu_result.error, imu_result.raw_error);
+    mark("rtc_imu");
 
     // BMI270 を初期化するのはコールドブートのときだけ（any-motion と FIFO の設定は寝ている間も残る）。
-    static m5sw::wakeup::WakeController wake;
-    auto wake_result = wake.begin(bus, cold_boot);
-    if (!wake_result.ok()) fail("wake_begin", wake_result.error, wake_result.raw_error);
-    m5sw::wakeup::WakeSnapshot snapshot;
-    wake_result = wake.capture(retained_rtc, retained_imu, &snapshot);
-    if (!wake_result.ok()) fail("wake_capture", wake_result.error, wake_result.raw_error);
-
+    // PM1 の初期化は 1 回だけ（電源側で初期化し、起床判定側はそれを借りる）。
     static m5sw::power::PowerController power;
     auto power_result = with_retry([&] { return power.begin(bus); });
     if (!power_result.ok()) fail("pm1_begin", power_result.error, power_result.raw_error);
+    mark("pbegin");
+
+    static m5sw::wakeup::WakeController wake;
+    auto wake_result = wake.begin(bus, cold_boot, &power.pm1_adapter());
+    if (!wake_result.ok()) fail("wake_begin", wake_result.error, wake_result.raw_error);
+    mark("wbegin");
+    m5sw::wakeup::WakeSnapshot snapshot;
+    wake_result = wake.capture(retained_rtc, retained_imu, &snapshot);
+    if (!wake_result.ok()) fail("wake_capture", wake_result.error, wake_result.raw_error);
+    mark("wake");
     power.set_touch_wake(true);  // 画面をタップしても起きる
     {
         std::uint16_t vin = 0;
@@ -1567,6 +1604,7 @@ extern "C" void app_main(void)
         apply_log_levels(s_usb_power);
         pm_apply(kCpuMhzIdle, true);
     }
+    mark("pm1");
 
     static ImuFifo fifo(bus);
     g_job.bus     = bus;
@@ -1651,10 +1689,13 @@ extern "C" void app_main(void)
                  fifo.read_reg(0x7D), fifo.read_reg(0x49), esp_err_to_name(aps));
     }
 
+    mark("decided");
     wake_result = with_retry([&] { return wake.clear_snapshot(snapshot); });
     if (!wake_result.ok()) fail("wake_clear", wake_result.error, wake_result.raw_error);
+    mark("wclr");
     rtc_result = with_retry([&] { return rtc.clear_flags(retained_rtc); });
     if (!rtc_result.ok()) fail("rtc_clear", rtc_result.error, rtc_result.raw_error);
+    mark("rclr");
     rtc_result = with_retry([&] { return rtc.disable_interrupts(); });
     if (!rtc_result.ok()) fail("rtc_disable", rtc_result.error, rtc_result.raw_error);
 
@@ -1680,21 +1721,22 @@ extern "C" void app_main(void)
         if (aps_result != ESP_OK) ESP_LOGW(kTag, "APS_RESTORE failed error=%s", esp_err_to_name(aps_result));
     }
 
-    hourly_tasks(&rtc, &power);
+    mark("cleared");
+    const std::int64_t now_epoch = hourly_tasks(&rtc, &power);
+    mark("hourly");
     if (usb_serial_jtag_is_connected()) dump_battery_history();
     wait_keys_released();
     // 夜は手首の動きで起きない（寝返りなどで何度も起きるのを防ぐ）。朝になったらタイマーで起きて設定し直す。
     bool night                   = false;
     std::int64_t until_morning_s = 0;
-    {
-        std::tm utc = {};
-        if (rtc.read_time(&utc).ok()) {
-            const std::int64_t jst = epoch_from_utc(utc) + kJstOffsetSec;
-            const int hour         = static_cast<int>((jst / 3600) % 24);
-            night                  = hour >= kNightFromHour && hour < kNightToHour;
-            until_morning_s        = static_cast<std::int64_t>(kNightToHour) * 3600 - jst % 86400;
-        }
+    if (now_epoch != 0) {
+        const std::int64_t jst = now_epoch + kJstOffsetSec;
+        const int hour         = static_cast<int>((jst / 3600) % 24);
+        night                  = hour >= kNightFromHour && hour < kNightToHour;
+        until_morning_s        = static_cast<std::int64_t>(kNightToHour) * 3600 - jst % 86400;
     }
+    mark("sleep");
+    print_marks();
     ESP_LOGI(kTag, "SLEEP at %lldms usb=%d night=%d", now_ms(), s_usb_power, night);
     if (s_usb_power) {
         vTaskDelay(kLogFlushWait);
