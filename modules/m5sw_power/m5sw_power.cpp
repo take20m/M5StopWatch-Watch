@@ -371,6 +371,12 @@ PowerResult PowerController::read_battery_mv(std::uint16_t* millivolts)
     return from_pm1(pm1_.read_battery_mv(millivolts));
 }
 
+PowerResult PowerController::read_vin_mv(std::uint16_t* millivolts)
+{
+    if (!initialized_) return {ESP_ERR_INVALID_STATE, M5PM1_ERR_NOT_INIT};
+    return from_pm1(pm1_.read_vin_mv(millivolts));
+}
+
 namespace {
 constexpr std::uint32_t kTouchLatchBit = 1u << (RTC_GPIO_STATUS_INT_S + 13);  // GPIO13 = RTC GPIO13
 static_assert(m5sw::board::kTouchIrq == GPIO_NUM_13, "touch latch assumes GPIO13");
@@ -452,7 +458,7 @@ PowerResult PowerController::enter_l2_quick(WakeSelection wake, std::uint64_t ti
     if (!result.ok()) return result;
     // 寝る前の 1 秒の待ちの間にタップされたら、すぐ起きるようにタイマーを 1ms にして寝る
     // （記録は残るので、起きた側で take_touch_latch() がタップとして扱う）。
-    const TickType_t step = pdMS_TO_TICKS(10);
+    const TickType_t step = pdMS_TO_TICKS(20);  // 待つ間は浅い眠り（アプリ側で有効にしていれば）
     for (TickType_t waited = 0; waited < kL2IdleSleepDelay; waited += step) {
         if (touch_wake_ && touch_latched()) {
             esp_sleep_enable_timer_wakeup(1000);

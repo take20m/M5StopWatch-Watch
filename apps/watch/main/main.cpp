@@ -24,6 +24,7 @@
 #include "driver/usb_serial_jtag_vfs.h"
 #include "esp_attr.h"
 #include "esp_log.h"
+#include "esp_pm.h"
 #include "esp_random.h"
 #include "esp_rtc_time.h"
 #include "esp_rom_sys.h"
@@ -60,12 +61,20 @@ constexpr std::uint64_t kKeyWakeMask     = (1ULL << m5sw::board::kKey1) | (1ULL 
 
 // ---- 画面 ----
 constexpr bool kTapSound               = false;  // タップで音を鳴らす（音はユーザーが用意するまで止めておく。2026-11-15）
-constexpr std::uint8_t kBrightness      = 60;        // %
-constexpr std::int64_t kLookShowMaxUs   = 10000000;  // 見続けていても 10 秒で消す
-constexpr std::int64_t kLookMinShowUs   = 3000000;   // 手首で点けたら、腕を下ろしてもこの時間は消さない
-constexpr std::int64_t kButtonShowUs    = 5000000;   // ボタンで点けたときは 5 秒（押すたびに延長）
+constexpr std::uint8_t kBrightness      = 50;        // %（60 から下げた。2026-11-16 省電力）
+constexpr std::int64_t kLookShowMaxUs   = 8000000;   // 見続けていても 8 秒で消す
+constexpr std::int64_t kLookMinShowUs   = 2500000;   // 手首で点けたら、腕を下ろしてもこの時間は消さない
+constexpr std::int64_t kButtonShowUs    = 4000000;   // ボタンで点けたときは 4 秒（押すたびに延長）
 constexpr std::int64_t kColdBootShowUs  = 5000000;
 constexpr std::int32_t kJstOffsetSec    = 9 * 3600;
+// 省電力（2026-11-16）
+constexpr int kCpuMhzIdle               = 80;   // ふだんの CPU の上限
+constexpr int kCpuMhzDraw               = 160;  // 最初の 1 枚を描く間だけ上げる（点くまでを遅らせない）
+constexpr int kCpuMhzMin                = 40;   // 何もしていないとき
+constexpr int kFrameMs                  = 40;   // 表示中の更新間隔（25fps）
+constexpr int kNightFromHour            = 1;    // この時間帯（日本時間）は手首の動きで起きない（タップとボタンだけ）
+constexpr int kNightToHour              = 6;
+constexpr std::uint16_t kUsbVinMv       = 4000; // USB の電圧がこれ以上なら「挿さっている」
 constexpr int kCenterX                  = 234;  // 表示領域 468x466 の中心
 constexpr int kCenterY                  = 233;
 constexpr std::uint16_t kColorDim       = 0x8410;  // 灰色
@@ -138,6 +147,8 @@ struct BatteryRecord {
     std::uint16_t mv;
     std::uint16_t shows;   // その時点までに画面を点けた回数
     std::uint32_t wakes;   // その時点までに起きた回数
+    std::uint32_t awake_s; // その時点までに起きていた時間の合計（秒、寝る前の待ちは除く）
+    std::uint32_t reserved;
 };
 constexpr int kBatteryRecords = 96;  // 4 日分
 RTC_DATA_ATTR BatteryRecord s_battery[kBatteryRecords];
@@ -171,6 +182,46 @@ auto with_retry(Fn fn)
 std::int64_t now_ms()
 {
     return esp_timer_get_time() / 1000;
+}
+
+// ---------------------------------------------------------------------------
+// 省電力: CPU の速さ・浅い眠り（light sleep）・ログ
+// ---------------------------------------------------------------------------
+bool s_usb_power = false;  // USB が挿さっている（ログを出し、浅い眠りは使わない。USB が切れるため）
+
+// 何もしていない間は CPU を kCpuMhzMin に落とし、light_sleep なら浅く眠らせる。
+void pm_apply(int max_mhz, bool light_sleep)
+{
+    esp_pm_config_t cfg    = {};
+    cfg.max_freq_mhz       = max_mhz;
+    cfg.min_freq_mhz       = kCpuMhzMin;
+    cfg.light_sleep_enable = light_sleep && !s_usb_power;
+    const esp_err_t err    = esp_pm_configure(&cfg);
+    if (err != ESP_OK) ESP_LOGW(kTag, "PM_CONFIG max=%d light=%d error=%s", max_mhz, light_sleep, esp_err_to_name(err));
+}
+
+// 浅い眠りの間も、使っているピンの設定を保つ（既定では眠る間すべてのピンが切り離される）。
+void keep_pins_in_light_sleep()
+{
+    for (const gpio_num_t pin :
+         {m5sw::board::kKey1, m5sw::board::kKey2, m5sw::board::kPm1Irq, m5sw::board::kTouchIrq, m5sw::board::kI2cSda,
+          m5sw::board::kI2cScl, GPIO_NUM_14, GPIO_NUM_38, GPIO_NUM_39, GPIO_NUM_40, GPIO_NUM_41, GPIO_NUM_42,
+          GPIO_NUM_45, GPIO_NUM_46}) {
+        gpio_sleep_sel_dis(pin);
+    }
+}
+
+// USB が挿さっていないときはログを出さない（UART への書き出しで起きている時間が延びる）。
+void apply_log_levels(bool usb)
+{
+    esp_log_level_set("*", usb ? ESP_LOG_INFO : ESP_LOG_ERROR);  // "*" は個別の設定を消すので先に呼ぶ
+    if (!usb) return;
+    esp_log_level_set("i2c_bus", ESP_LOG_ERROR);
+    esp_log_level_set("M5IOE1_I2C", ESP_LOG_WARN);
+    esp_log_level_set("M5IOE1_GPIO", ESP_LOG_WARN);
+    esp_log_level_set("M5IOE1_SYS", ESP_LOG_WARN);
+    esp_log_level_set("M5PM1_I2C", ESP_LOG_WARN);
+    esp_log_level_set("M5PM1_SYS", ESP_LOG_WARN);
 }
 
 // ---------------------------------------------------------------------------
@@ -278,7 +329,8 @@ void hourly_tasks(m5sw::wakeup::RtcWakeup* rtc, m5sw::power::PowerController* po
 
     std::uint16_t mv = 0;
     (void)with_retry([&] { return power->read_battery_mv(&mv); });
-    const BatteryRecord rec = {now, mv, static_cast<std::uint16_t>(s_show_count), s_wake_count};
+    const BatteryRecord rec = {now, mv, static_cast<std::uint16_t>(s_show_count), s_wake_count,
+                               static_cast<std::uint32_t>(s_awake_ms / 1000), 0};
     if (s_battery_count < kBatteryRecords) {
         s_battery[s_battery_count++] = rec;
     } else {
@@ -304,7 +356,7 @@ void battery_save()
 {
     nvs_handle_t h;
     if (!battery_nvs_open(&h, NVS_READWRITE)) return;
-    nvs_set_blob(h, "hist", s_battery, sizeof(BatteryRecord) * s_battery_count);
+    nvs_set_blob(h, "hist2", s_battery, sizeof(BatteryRecord) * s_battery_count);
     nvs_commit(h);
     nvs_close(h);
 }
@@ -315,7 +367,7 @@ void battery_load()
     nvs_handle_t h;
     if (!battery_nvs_open(&h, NVS_READONLY)) return;
     size_t size = sizeof(s_battery);
-    if (nvs_get_blob(h, "hist", s_battery, &size) == ESP_OK) s_battery_count = size / sizeof(BatteryRecord);
+    if (nvs_get_blob(h, "hist2", s_battery, &size) == ESP_OK) s_battery_count = size / sizeof(BatteryRecord);
     nvs_close(h);
 }
 
@@ -323,8 +375,9 @@ void battery_load()
 void dump_battery_history()
 {
     for (int i = 0; i < s_battery_count; ++i) {
-        ESP_LOGI(kTag, "BAT_HIST %d epoch=%lld mv=%u shows=%u wakes=%lu", i, static_cast<long long>(s_battery[i].epoch),
-                 s_battery[i].mv, s_battery[i].shows, static_cast<unsigned long>(s_battery[i].wakes));
+        ESP_LOGI(kTag, "BAT_HIST %d epoch=%lld mv=%u shows=%u wakes=%lu awake_s=%lu", i,
+                 static_cast<long long>(s_battery[i].epoch), s_battery[i].mv, s_battery[i].shows,
+                 static_cast<unsigned long>(s_battery[i].wakes), static_cast<unsigned long>(s_battery[i].awake_s));
     }
 }
 
@@ -537,7 +590,7 @@ LookResult check_look(ImuFifo* fifo, void (*pose_started)())
     int pose_run = 0;
     int away_run = 0;
     while (esp_timer_get_time() - start < kWindowUs) {
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(20));  // FIFO は 50Hz。待つ間は CPU を浅く眠らせる
         const int added = fifo->pull();
         for (int i = added - 1; i >= 0; --i) {
             Accel a;
@@ -1139,6 +1192,7 @@ DisplayJob g_job;
 void display_task(void*)
 {
     DisplayJob& job              = g_job;
+    pm_apply(kCpuMhzDraw, false);  // 画面の電源が入っている間は浅く眠らない（ピンと転送を乱さないため）
     const std::int64_t t_start   = now_ms();
     static watch::WatchPanel panel;
     const esp_err_t begun        = panel.begin(job.bus);
@@ -1197,6 +1251,7 @@ void display_task(void*)
         const esp_err_t pushed = panel.push_rows(dirty.y0, dirty.y1);
         const std::int64_t t_push = now_ms();
         (void)panel.set_brightness_percent(kBrightness);  // 時計を書いてから光らせる
+        pm_apply(kCpuMhzIdle, false);
         ESP_LOGI(kTag, "FRAME_TIMING cmd_wait_end=%lld draw=%lldms push=%lldms", t_draw0, t_draw1 - t_draw0,
                  t_push - t_draw1);
         if (pushed != ESP_OK) ESP_LOGW(kTag, "PUSH_FAIL error=%s", esp_err_to_name(pushed));
@@ -1356,7 +1411,7 @@ void display_task(void*)
             }
             a_was = a;
             b_was = b;
-            vTaskDelay(pdMS_TO_TICKS(20));
+            vTaskDelay(pdMS_TO_TICKS(kFrameMs));
         }
         if (vibrating) (void)watch::set_vibration(job.bus, false);
         watch::audio_shutdown();
@@ -1370,6 +1425,7 @@ void display_task(void*)
         const esp_err_t off = panel.sleep();
         ESP_LOGI(kTag, "PREP_ABORT power_off=%s", esp_err_to_name(off));
     }
+    pm_apply(kCpuMhzIdle, true);
     xSemaphoreGive(job.done);
     vTaskDelete(nullptr);
 }
@@ -1428,12 +1484,8 @@ extern "C" void app_main(void)
     const bool touch_latched = m5sw::power::PowerController::take_touch_latch();
     m5sw::test_support::TestContext context = {};
     ESP_ERROR_CHECK(m5sw::test_support::initialize(&context));
-    esp_log_level_set("i2c_bus", ESP_LOG_ERROR);
-    esp_log_level_set("M5IOE1_I2C", ESP_LOG_WARN);
-    esp_log_level_set("M5IOE1_GPIO", ESP_LOG_WARN);
-    esp_log_level_set("M5IOE1_SYS", ESP_LOG_WARN);
-    esp_log_level_set("M5PM1_I2C", ESP_LOG_WARN);
-    esp_log_level_set("M5PM1_SYS", ESP_LOG_WARN);
+    apply_log_levels(false);  // USB かどうかは PM1 を読むまで分からない
+    keep_pins_in_light_sleep();
 
     const esp_sleep_wakeup_cause_t cause = context.wake_cause;
     // 起きた直後の PM1 IRQ 線（GPIO12）の状態。寝ている間は Low で起きる設定。
@@ -1475,6 +1527,12 @@ extern "C" void app_main(void)
     auto power_result = with_retry([&] { return power.begin(bus); });
     if (!power_result.ok()) fail("pm1_begin", power_result.error, power_result.raw_error);
     power.set_touch_wake(true);  // 画面をタップしても起きる
+    {
+        std::uint16_t vin = 0;
+        s_usb_power       = power.read_vin_mv(&vin).ok() && vin >= kUsbVinMv;
+        apply_log_levels(s_usb_power);
+        pm_apply(kCpuMhzIdle, true);
+    }
 
     static ImuFifo fifo(bus);
     g_job.bus     = bus;
@@ -1587,9 +1645,25 @@ extern "C" void app_main(void)
     hourly_tasks(&rtc, &power);
     if (usb_serial_jtag_is_connected()) dump_battery_history();
     wait_keys_released();
-    ESP_LOGI(kTag, "SLEEP at %lldms", now_ms());
-    vTaskDelay(kLogFlushWait);
-    if (!cold_boot) s_awake_ms += now_ms() + 1000;  // enter_l2_quick 内の 1 秒待ちも足す
+    // 夜は手首の動きで起きない（寝返りなどで何度も起きるのを防ぐ）。朝になったらタイマーで起きて設定し直す。
+    bool night                   = false;
+    std::int64_t until_morning_s = 0;
+    {
+        std::tm utc = {};
+        if (rtc.read_time(&utc).ok()) {
+            const std::int64_t jst = epoch_from_utc(utc) + kJstOffsetSec;
+            const int hour         = static_cast<int>((jst / 3600) % 24);
+            night                  = hour >= kNightFromHour && hour < kNightToHour;
+            until_morning_s        = static_cast<std::int64_t>(kNightToHour) * 3600 - jst % 86400;
+        }
+    }
+    ESP_LOGI(kTag, "SLEEP at %lldms usb=%d night=%d", now_ms(), s_usb_power, night);
+    if (s_usb_power) {
+        vTaskDelay(kLogFlushWait);
+    } else {
+        esp_deep_sleep_disable_rom_logging();  // 起きるたびの ROM の表示を止める
+    }
+    if (!cold_boot) s_awake_ms += now_ms();  // 寝る前の 1 秒待ちは浅い眠りなので数えない
     // タイマーが動いていたら、終わる時刻に起きる（寝る前に 1 秒待つ分を引く）。
     std::int64_t sleep_us = static_cast<std::int64_t>(kTimerFallbackUs);
     if (s_app.tm_running) {
@@ -1597,7 +1671,8 @@ extern "C" void app_main(void)
         sleep_us                = std::min(sleep_us, std::max<std::int64_t>(1000, left));
         ESP_LOGI(kTag, "TIMER running, wake in %lldms", sleep_us / 1000);
     }
-    power_result = power.enter_l2_quick(m5sw::power::WakeSelection::rtc_imu, static_cast<std::uint64_t>(sleep_us),
+    if (night) sleep_us = std::min(sleep_us, std::max<std::int64_t>(1000000, until_morning_s * 1000000 + 5000000));
+    power_result = power.enter_l2_quick(night ? m5sw::power::WakeSelection::none : m5sw::power::WakeSelection::rtc_imu, static_cast<std::uint64_t>(sleep_us),
                                         m5sw::power::L2Pm1IdleSleep::enabled, kKeyWakeMask);
     fail("l2_returned", power_result.error, power_result.raw_error);
 }

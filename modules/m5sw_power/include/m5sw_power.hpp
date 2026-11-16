@@ -92,6 +92,8 @@ public:
                                              std::uint64_t key_wake_mask = 0);
     // Reads the battery voltage through PM1 (begin() must have succeeded).
     [[nodiscard]] PowerResult read_battery_mv(std::uint16_t* millivolts);
+    // USB（5VIN）の電圧。挿していなければ 0 付近。
+    [[nodiscard]] PowerResult read_vin_mv(std::uint16_t* millivolts);
 
 private:
     [[nodiscard]] PowerResult from_pm1(DriverResult result) const;
