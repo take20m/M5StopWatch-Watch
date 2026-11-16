@@ -206,6 +206,8 @@ void mark(const char* name)
 {
     if (s_mark_count < 20) s_marks[s_mark_count++] = {name, static_cast<std::int32_t>(now_ms())};
 }
+int s_pm1_wake_polls = 0;  // PM1 が応答するまでに読んだ回数（計測用）
+
 void print_marks()
 {
     char line[400];
@@ -214,7 +216,22 @@ void print_marks()
         n += snprintf(line + n, sizeof(line) - n, " %s=%ld", s_marks[i].name, static_cast<long>(s_marks[i].ms));
     }
     line[n] = 0;
-    ESP_LOGI(kTag, "TIMELINE%s", line);
+    ESP_LOGI(kTag, "TIMELINE%s pm1_polls=%d", line, s_pm1_wake_polls);
+}
+
+
+// PM1 は I2C の眠りから覚めるのに数〜十数 ms かかる。M5PM1 の begin は読み込みに 1 回失敗すると
+// 50ms 待ってやり直すので、先にこちらで 2ms 刻みに応答を確かめておく（読むこと自体が起こす合図になる）。
+void wait_pm1_awake(i2c_bus_handle_t bus)
+{
+    i2c_bus_device_handle_t dev = i2c_bus_device_create(bus, m5sw::board::kPm1Address, 100000);
+    if (dev == nullptr) return;
+    std::uint8_t value = 0;
+    for (s_pm1_wake_polls = 1; s_pm1_wake_polls <= 20; ++s_pm1_wake_polls) {
+        if (i2c_bus_read_byte(dev, 0x00, &value) == ESP_OK) break;  // 0x00 = DEVICE_ID
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    i2c_bus_device_delete(&dev);
 }
 
 bool s_usb_power = false;  // USB が挿さっている（ログを出し、浅い眠りは使わない。USB が切れるため）
@@ -1584,6 +1601,8 @@ extern "C" void app_main(void)
 
     // BMI270 を初期化するのはコールドブートのときだけ（any-motion と FIFO の設定は寝ている間も残る）。
     // PM1 の初期化は 1 回だけ（電源側で初期化し、起床判定側はそれを借りる）。
+    wait_pm1_awake(bus);
+    mark("pwake");
     static m5sw::power::PowerController power;
     auto power_result = with_retry([&] { return power.begin(bus); });
     if (!power_result.ok()) fail("pm1_begin", power_result.error, power_result.raw_error);
@@ -1690,6 +1709,7 @@ extern "C" void app_main(void)
     }
 
     mark("decided");
+    wait_pm1_awake(bus);  // 判定や表示の間に PM1 が I2C の眠りに入っている（50ms のやり直し待ちを避ける）
     wake_result = with_retry([&] { return wake.clear_snapshot(snapshot); });
     if (!wake_result.ok()) fail("wake_clear", wake_result.error, wake_result.raw_error);
     mark("wclr");
