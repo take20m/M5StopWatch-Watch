@@ -137,23 +137,31 @@ constexpr std::size_t kFrameBytes      = 6;
 RTC_DATA_ATTR std::uint32_t s_wake_count   = 0;
 RTC_DATA_ATTR std::uint32_t s_show_count   = 0;
 RTC_DATA_ATTR std::uint64_t s_awake_ms     = 0;
+// 電力の内訳（2026-11-16）。コールドブートから数える。
+RTC_DATA_ATTR std::uint32_t s_false_count    = 0;  // 手首の動きで起きたが点けなかった回数
+RTC_DATA_ATTR std::uint64_t s_false_awake_ms = 0;  // そのときに起きていた時間の合計
+RTC_DATA_ATTR std::uint64_t s_shown_ms       = 0;  // 画面を点けていた時間の合計
 RTC_DATA_ATTR std::uint32_t s_timer_count  = 0;
 RTC_DATA_ATTR std::int64_t s_last_sync_epoch    = 0;  // 最後に時刻を合わせた時刻（UTC の秒）
 RTC_DATA_ATTR std::int64_t s_last_wifi_try_epoch = 0;  // 最後に Wi-Fi で合わせようとした時刻
 
-// 電池の記録（1 時間ごとの定期起床で 1 件。USB を外して使った後、つないだときに読み出す）
+// 電池の記録（15 分ごとに 1 件、フラッシュに残す。USB を外して使った後、つないだときに読み出す）。
+// 回数と時間はコールドブートからの累計。
 struct BatteryRecord {
-    std::int64_t epoch;
+    std::uint32_t epoch;
     std::uint16_t mv;
-    std::uint16_t shows;   // その時点までに画面を点けた回数
-    std::uint32_t wakes;   // その時点までに起きた回数
-    std::uint32_t awake_s; // その時点までに起きていた時間の合計（秒、寝る前の待ちは除く）
-    std::uint32_t reserved;
+    std::uint16_t reserved;
+    std::uint32_t wakes;        // 起きた回数
+    std::uint32_t shows;        // 画面を点けた回数
+    std::uint32_t false_wakes;  // 手首の動きで起きたが点けなかった回数
+    std::uint32_t awake_cs;     // 起きていた時間（1/100 秒。寝る前の待ちは除く）
+    std::uint32_t false_cs;     // そのうち点けなかった起床の分
+    std::uint32_t shown_cs;     // 画面を点けていた時間
 };
-constexpr int kBatteryRecords = 96;  // 4 日分
-RTC_DATA_ATTR BatteryRecord s_battery[kBatteryRecords];
-RTC_DATA_ATTR std::uint16_t s_battery_count = 0;
-RTC_DATA_ATTR std::int64_t s_next_hourly_epoch = 0;  // 次に 1 時間ごとの用事（電池の記録・時刻合わせの確認）をする時刻
+constexpr int kBatteryRecords        = 192;  // 48 時間分
+constexpr std::int64_t kRecordEveryS = 900;
+RTC_DATA_ATTR std::int64_t s_next_record_epoch = 0;
+RTC_DATA_ATTR std::int64_t s_next_hourly_epoch = 0;  // 次に 1 時間ごとの用事（時刻合わせの確認）をする時刻
 constexpr int kHistLen                     = 128;
 RTC_DATA_ATTR std::int16_t s_hist[kHistLen][3];
 RTC_DATA_ATTR std::uint16_t s_hist_head  = 0;
@@ -307,7 +315,9 @@ void maybe_wifi_time_sync(m5sw::wakeup::RtcWakeup* rtc, bool force)
     s_last_wifi_try_epoch    = now;
     const std::int64_t start = now_ms();
     std::int64_t synced = 0, drift = 0;
+    pm_apply(kCpuMhzDraw, false);  // 早く終わらせたほうが無線の電力が少ない
     const esp_err_t err = watch::wifi_time_sync(rtc, &synced, &drift);
+    pm_apply(kCpuMhzIdle, true);
     if (err == ESP_OK) {
         s_last_sync_epoch     = synced;
         s_last_wifi_try_epoch = synced;
@@ -316,7 +326,7 @@ void maybe_wifi_time_sync(m5sw::wakeup::RtcWakeup* rtc, bool force)
              now_ms() - start);
 }
 
-void battery_save();
+void battery_append(const BatteryRecord& rec);
 
 // 1 時間ごとの用事。起きた理由によらず、前回から 1 時間たっていればする（腕を動かしている間は定期起床が来ないため）。
 void hourly_tasks(m5sw::wakeup::RtcWakeup* rtc, m5sw::power::PowerController* power)
@@ -324,20 +334,23 @@ void hourly_tasks(m5sw::wakeup::RtcWakeup* rtc, m5sw::power::PowerController* po
     std::tm utc = {};
     if (!rtc->read_time(&utc).ok()) return;
     const std::int64_t now = epoch_from_utc(utc);
+    if (s_next_record_epoch == 0 || now >= s_next_record_epoch) {
+        s_next_record_epoch = now + kRecordEveryS;
+        std::uint16_t mv    = 0;
+        (void)with_retry([&] { return power->read_battery_mv(&mv); });
+        BatteryRecord rec = {};
+        rec.epoch         = static_cast<std::uint32_t>(now);
+        rec.mv            = mv;
+        rec.wakes         = s_wake_count;
+        rec.shows         = s_show_count;
+        rec.false_wakes   = s_false_count;
+        rec.awake_cs      = static_cast<std::uint32_t>(s_awake_ms / 10);
+        rec.false_cs      = static_cast<std::uint32_t>(s_false_awake_ms / 10);
+        rec.shown_cs      = static_cast<std::uint32_t>(s_shown_ms / 10);
+        battery_append(rec);
+    }
     if (s_next_hourly_epoch != 0 && now < s_next_hourly_epoch) return;
     s_next_hourly_epoch = now + 3600;
-
-    std::uint16_t mv = 0;
-    (void)with_retry([&] { return power->read_battery_mv(&mv); });
-    const BatteryRecord rec = {now, mv, static_cast<std::uint16_t>(s_show_count), s_wake_count,
-                               static_cast<std::uint32_t>(s_awake_ms / 1000), 0};
-    if (s_battery_count < kBatteryRecords) {
-        s_battery[s_battery_count++] = rec;
-    } else {
-        for (int i = 1; i < kBatteryRecords; ++i) s_battery[i - 1] = s_battery[i];
-        s_battery[kBatteryRecords - 1] = rec;
-    }
-    battery_save();
     maybe_wifi_time_sync(rtc, false);
 }
 
@@ -352,33 +365,52 @@ bool battery_nvs_open(nvs_handle_t* h, nvs_open_mode_t mode)
     return err == ESP_OK && nvs_open("battery", mode, h) == ESP_OK;
 }
 
-void battery_save()
+int battery_read(nvs_handle_t h, BatteryRecord* out)
+{
+    size_t size = sizeof(BatteryRecord) * kBatteryRecords;
+    if (nvs_get_blob(h, "hist3", out, &size) != ESP_OK) return 0;
+    return static_cast<int>(size / sizeof(BatteryRecord));
+}
+
+void battery_append(const BatteryRecord& rec)
 {
     nvs_handle_t h;
     if (!battery_nvs_open(&h, NVS_READWRITE)) return;
-    nvs_set_blob(h, "hist2", s_battery, sizeof(BatteryRecord) * s_battery_count);
-    nvs_commit(h);
-    nvs_close(h);
-}
-
-// 起動直後（電池切れからの復帰を含む）に、フラッシュの記録を RTC メモリへ戻す。
-void battery_load()
-{
-    nvs_handle_t h;
-    if (!battery_nvs_open(&h, NVS_READONLY)) return;
-    size_t size = sizeof(s_battery);
-    if (nvs_get_blob(h, "hist2", s_battery, &size) == ESP_OK) s_battery_count = size / sizeof(BatteryRecord);
+    auto* list = static_cast<BatteryRecord*>(calloc(kBatteryRecords, sizeof(BatteryRecord)));
+    if (list != nullptr) {
+        int n = battery_read(h, list);
+        if (n >= kBatteryRecords) {
+            std::memmove(list, list + 1, sizeof(BatteryRecord) * (kBatteryRecords - 1));
+            n = kBatteryRecords - 1;
+        }
+        list[n++] = rec;
+        nvs_set_blob(h, "hist3", list, sizeof(BatteryRecord) * n);
+        nvs_commit(h);
+        free(list);
+    }
     nvs_close(h);
 }
 
 // 電池の記録を全部ログに出す（USB がつながっているときに毎回。電池の持ちを測るため）。
 void dump_battery_history()
 {
-    for (int i = 0; i < s_battery_count; ++i) {
-        ESP_LOGI(kTag, "BAT_HIST %d epoch=%lld mv=%u shows=%u wakes=%lu awake_s=%lu", i,
-                 static_cast<long long>(s_battery[i].epoch), s_battery[i].mv, s_battery[i].shows,
-                 static_cast<unsigned long>(s_battery[i].wakes), static_cast<unsigned long>(s_battery[i].awake_s));
+    nvs_handle_t h;
+    if (!battery_nvs_open(&h, NVS_READONLY)) return;
+    auto* list = static_cast<BatteryRecord*>(calloc(kBatteryRecords, sizeof(BatteryRecord)));
+    if (list != nullptr) {
+        const int n = battery_read(h, list);
+        for (int i = 0; i < n; ++i) {
+            const BatteryRecord& r = list[i];
+            ESP_LOGI(kTag, "BAT_HIST %d epoch=%lu mv=%u wakes=%lu shows=%lu false=%lu awake_cs=%lu false_cs=%lu shown_cs=%lu",
+                     i, static_cast<unsigned long>(r.epoch), r.mv, static_cast<unsigned long>(r.wakes),
+                     static_cast<unsigned long>(r.shows), static_cast<unsigned long>(r.false_wakes),
+                     static_cast<unsigned long>(r.awake_cs), static_cast<unsigned long>(r.false_cs),
+                     static_cast<unsigned long>(r.shown_cs));
+            if (i % 16 == 15) vTaskDelay(pdMS_TO_TICKS(20));  // USB に流し切る
+        }
+        free(list);
     }
+    nvs_close(h);
 }
 
 // ---------------------------------------------------------------------------
@@ -1417,6 +1449,7 @@ void display_task(void*)
         watch::audio_shutdown();
         if (s_app.tm_alarm) s_app.tm_alarm = false;  // 鳴り終わった
         const std::int64_t shown_ms = now_ms() - first_frame_ms;
+        s_shown_ms += shown_ms;
         const esp_err_t off         = panel.sleep();
         ESP_LOGI(kTag, "HIDE after %lldms (%s) power_off=%s touch_irq_samples=%d", shown_ms, reason,
                  esp_err_to_name(off), touch_irqs);
@@ -1480,6 +1513,7 @@ void show_watch(ImuFifo* fifo, ShowMode mode)
 extern "C" void app_main(void)
 {
     const std::int64_t app_start_ms = now_ms();
+    bool false_wake                 = false;
     // 寝ている間〜ここまでのタップの記録（GPIO13 を設定し直す前に読む）
     const bool touch_latched = m5sw::power::PowerController::take_touch_latch();
     m5sw::test_support::TestContext context = {};
@@ -1543,8 +1577,10 @@ extern "C" void app_main(void)
     if (cold_boot) {
         s_wake_count = s_show_count = 0;
         s_awake_ms                  = 0;
+        s_false_count               = 0;
+        s_false_awake_ms = s_shown_ms = 0;
+        s_next_record_epoch         = 0;
         s_app                       = AppState{};  // 書き込み直後などは RTC メモリに前の値が残っていることがある
-        battery_load();
         ESP_LOGI(kTag, "COLD_BOOT cause=%d reset_reason=%d", static_cast<int>(cause), static_cast<int>(esp_reset_reason()));
         {
             const esp_err_t mux = watch::hold_usb_mux(bus);
@@ -1597,6 +1633,8 @@ extern "C" void app_main(void)
             show_watch(&fifo, ShowMode::button);
         } else {
             display_abort();  // 姿勢に入りかけて画面の準備を始めていたら、表示せずに切る
+            ++s_false_count;
+            false_wake = true;
         }
     } else {
         ++s_wake_count;
@@ -1664,6 +1702,7 @@ extern "C" void app_main(void)
         esp_deep_sleep_disable_rom_logging();  // 起きるたびの ROM の表示を止める
     }
     if (!cold_boot) s_awake_ms += now_ms();  // 寝る前の 1 秒待ちは浅い眠りなので数えない
+    if (false_wake) s_false_awake_ms += now_ms();
     // タイマーが動いていたら、終わる時刻に起きる（寝る前に 1 秒待つ分を引く）。
     std::int64_t sleep_us = static_cast<std::int64_t>(kTimerFallbackUs);
     if (s_app.tm_running) {
