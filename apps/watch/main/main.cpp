@@ -35,6 +35,8 @@
 #include "freertos/task.h"
 #include "i2c_bus.h"
 #include "m5sw_board.hpp"
+#include "nvs.h"
+#include "nvs_flash.h"
 #include "time_sync.hpp"
 #include "watch_audio.hpp"
 #include "watch_fonts.h"
@@ -263,6 +265,8 @@ void maybe_wifi_time_sync(m5sw::wakeup::RtcWakeup* rtc, bool force)
              now_ms() - start);
 }
 
+void battery_save();
+
 // 1 時間ごとの用事。起きた理由によらず、前回から 1 時間たっていればする（腕を動かしている間は定期起床が来ないため）。
 void hourly_tasks(m5sw::wakeup::RtcWakeup* rtc, m5sw::power::PowerController* power)
 {
@@ -281,7 +285,38 @@ void hourly_tasks(m5sw::wakeup::RtcWakeup* rtc, m5sw::power::PowerController* po
         for (int i = 1; i < kBatteryRecords; ++i) s_battery[i - 1] = s_battery[i];
         s_battery[kBatteryRecords - 1] = rec;
     }
+    battery_save();
     maybe_wifi_time_sync(rtc, false);
+}
+
+// 電池の記録はフラッシュ（NVS）にも残す。電池が切れると RTC メモリは消えるため。
+bool battery_nvs_open(nvs_handle_t* h, nvs_open_mode_t mode)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        err = nvs_flash_init();
+    }
+    return err == ESP_OK && nvs_open("battery", mode, h) == ESP_OK;
+}
+
+void battery_save()
+{
+    nvs_handle_t h;
+    if (!battery_nvs_open(&h, NVS_READWRITE)) return;
+    nvs_set_blob(h, "hist", s_battery, sizeof(BatteryRecord) * s_battery_count);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+// 起動直後（電池切れからの復帰を含む）に、フラッシュの記録を RTC メモリへ戻す。
+void battery_load()
+{
+    nvs_handle_t h;
+    if (!battery_nvs_open(&h, NVS_READONLY)) return;
+    size_t size = sizeof(s_battery);
+    if (nvs_get_blob(h, "hist", s_battery, &size) == ESP_OK) s_battery_count = size / sizeof(BatteryRecord);
+    nvs_close(h);
 }
 
 // 電池の記録を全部ログに出す（USB がつながっているときに毎回。電池の持ちを測るため）。
@@ -1451,6 +1486,7 @@ extern "C" void app_main(void)
         s_wake_count = s_show_count = 0;
         s_awake_ms                  = 0;
         s_app                       = AppState{};  // 書き込み直後などは RTC メモリに前の値が残っていることがある
+        battery_load();
         ESP_LOGI(kTag, "COLD_BOOT cause=%d reset_reason=%d", static_cast<int>(cause), static_cast<int>(esp_reset_reason()));
         {
             const esp_err_t mux = watch::hold_usb_mux(bus);
