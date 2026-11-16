@@ -160,6 +160,7 @@ struct BatteryRecord {
 };
 constexpr int kBatteryRecords        = 192;  // 48 時間分
 constexpr std::int64_t kRecordEveryS = 900;
+constexpr std::int64_t kReinitMinSleepMs = 20LL * 60 * 1000;  // これより短い眠りからのタイマー起床では設定し直さない
 RTC_DATA_ATTR std::int64_t s_next_record_epoch = 0;
 RTC_DATA_ATTR std::int64_t s_next_hourly_epoch = 0;  // 次に 1 時間ごとの用事（時刻合わせの確認）をする時刻
 constexpr int kHistLen                     = 128;
@@ -167,9 +168,51 @@ RTC_DATA_ATTR std::int16_t s_hist[kHistLen][3];
 RTC_DATA_ATTR std::uint16_t s_hist_head  = 0;
 RTC_DATA_ATTR std::uint16_t s_hist_count = 0;
 
+// 起きた理由の記録（2026-11-17。USB を抜いている間に何が起きたかを、つないだときに読む）。
+// リセット（BOARD_FAIL の再起動）でも消えない領域に置く。電源を入れ直したときは magic で初期化する。
+struct WakeLogEntry {
+    std::uint32_t rc_s;      // RTC の時計（秒）
+    std::uint32_t slept_ms;  // 前回寝てから起きるまで（分からなければ 0xFFFFFFFF）
+    std::uint16_t awake_ms;  // 起きていた時間（寝る前の待ちは除く）
+    std::uint8_t cause;      // esp_sleep_wakeup_cause_t。コールドブートは 100 + リセット理由
+    std::uint8_t flags;      // kWl*
+};
+constexpr int kWakeLogLen             = 64;
+constexpr std::uint32_t kWakeLogMagic = 0x574C4F47;
+enum : std::uint8_t {
+    kWlTouchLatch = 1,    // 寝ている間のタップの記録があった
+    kWlExt1Touch  = 2,    // ext1 の原因がタッチの線
+    kWlExt1Key    = 4,    // ext1 の原因がボタン
+    kWlPm1IrqLow  = 8,    // 起きた直後の PM1 IRQ 線が Low
+    kWlQuickArmed = 16,   // 寝る前の待ちでタップを見つけて 1ms で寝た
+    kWlReinit     = 32,   // ボードを設定し直した（1 時間ごとの見回りの経路）
+    kWlShown      = 64,   // 画面を点けた
+    kWlFalse      = 128,  // 手首の動きで起きたが点けなかった
+};
+RTC_NOINIT_ATTR WakeLogEntry s_wlog[kWakeLogLen];
+RTC_NOINIT_ATTR std::uint32_t s_wlog_magic;
+RTC_NOINIT_ATTR std::uint32_t s_wlog_head;
+RTC_NOINIT_ATTR std::uint32_t s_wlog_count;
+RTC_NOINIT_ATTR std::int64_t s_sleep_start_rc_us;
+RTC_NOINIT_ATTR char s_fail_stage[16];
+
+void wake_log_add(const WakeLogEntry& e)
+{
+    if (s_wlog_magic != kWakeLogMagic) {
+        s_wlog_magic = kWakeLogMagic;
+        s_wlog_head = s_wlog_count = 0;
+        s_fail_stage[0]            = '\0';
+    }
+    s_wlog[s_wlog_head % kWakeLogLen] = e;
+    s_wlog_head                       = (s_wlog_head + 1) % kWakeLogLen;
+    if (s_wlog_count < kWakeLogLen) ++s_wlog_count;
+}
+
 [[noreturn]] void fail(const char* stage, esp_err_t error, int raw_error)
 {
     ESP_LOGE(kTag, "BOARD_FAIL stage=%s error=%s raw=%d -> restart", stage, esp_err_to_name(error), raw_error);
+    std::strncpy(s_fail_stage, stage, sizeof(s_fail_stage) - 1);
+    s_fail_stage[sizeof(s_fail_stage) - 1] = '\0';
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
 }
@@ -455,6 +498,16 @@ void dump_battery_history()
         free(list);
     }
     nvs_close(h);
+    if (s_wlog_magic != kWakeLogMagic) return;
+    ESP_LOGI(kTag, "WAKE_LOG count=%lu last_fail=%s", static_cast<unsigned long>(s_wlog_count),
+             s_fail_stage[0] != '\0' ? s_fail_stage : "-");
+    for (std::uint32_t k = 0; k < s_wlog_count; ++k) {
+        const WakeLogEntry& e = s_wlog[(s_wlog_head + kWakeLogLen - s_wlog_count + k) % kWakeLogLen];
+        ESP_LOGI(kTag, "WAKE_LOG %lu rc=%lu slept=%ld awake=%u cause=%u flags=0x%02X", static_cast<unsigned long>(k),
+                 static_cast<unsigned long>(e.rc_s), static_cast<long>(static_cast<std::int32_t>(e.slept_ms)),
+                 e.awake_ms, e.cause, e.flags);
+        if (k % 16 == 15) vTaskDelay(pdMS_TO_TICKS(20));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1575,6 +1628,7 @@ extern "C" void app_main(void)
     bool false_wake                 = false;
     // 寝ている間〜ここまでのタップの記録（GPIO13 を設定し直す前に読む）
     const bool touch_latched = m5sw::power::PowerController::take_touch_latch();
+    const bool quick_armed   = m5sw::power::PowerController::quick_wake_armed();
     mark("app");
     m5sw::test_support::TestContext context = {};
     ESP_ERROR_CHECK(m5sw::test_support::initialize(&context));
@@ -1587,6 +1641,9 @@ extern "C" void app_main(void)
     const int pm1_irq_level = rtc_gpio_get_level(m5sw::board::kPm1Irq);
     const bool cold_boot = cause != ESP_SLEEP_WAKEUP_EXT0 && cause != ESP_SLEEP_WAKEUP_EXT1 &&
                            cause != ESP_SLEEP_WAKEUP_TIMER;
+    // 前回寝てから起きるまでの時間（RTC の時計。コールドブートや記録がないときは分からない）。
+    const bool slept_known = !cold_boot && s_wlog_magic == kWakeLogMagic && rc_now_us() >= s_sleep_start_rc_us;
+    const std::int64_t slept_ms = slept_known ? (rc_now_us() - s_sleep_start_rc_us) / 1000 : -1;
     keys_as_inputs();
     watch_keys_while_awake();
     // ボタンで起きたかの手がかり（ext1 の状態と、いま押されているか）。ext0（手首）と同時だと原因は ext0 と報告される。
@@ -1736,7 +1793,10 @@ extern "C" void app_main(void)
 
     const bool tap_wake = !cold_boot && (touch_latched || (ext1_status & (1ULL << m5sw::board::kTouchIrq)) != 0);
     // 1 時間ごとの見回りのときだけ、ボードを設定し直す（タップやタイマーのアラームで起きたときはしない）。
-    const bool fallback_timer_wake = cause == ESP_SLEEP_WAKEUP_TIMER && !tap_wake && !g_shown;
+    // 寝てすぐのタイマー起床（原因を調べ中。2026-11-17 の夜に 4.5 秒ごとに起き続けた）では、
+    // 3.4 秒かかる設定し直しをしない（それ自体が次の起床を呼んでいる可能性がある）。
+    const bool short_timer_wake    = slept_ms >= 0 && slept_ms < kReinitMinSleepMs;
+    const bool fallback_timer_wake = cause == ESP_SLEEP_WAKEUP_TIMER && !tap_wake && !g_shown && !short_timer_wake;
     if (cold_boot || fallback_timer_wake) {
         // ボード全体を L2 用に整え、BMI270 の any-motion と FIFO を設定する（タイマー起床では設定し直して復旧を試みる）。
         wake_result = wake.begin_imu();
@@ -1779,6 +1839,21 @@ extern "C" void app_main(void)
         esp_deep_sleep_disable_rom_logging();  // 起きるたびの ROM の表示を止める
     }
     if (!cold_boot) s_awake_ms += now_ms();  // 寝る前の 1 秒待ちは浅い眠りなので数えない
+    {
+        WakeLogEntry e = {};
+        e.rc_s         = static_cast<std::uint32_t>(rc_now_us() / 1000000);
+        e.slept_ms     = slept_ms >= 0 ? static_cast<std::uint32_t>(std::min<std::int64_t>(slept_ms, 0x7FFFFFFF))
+                                       : 0xFFFFFFFFu;
+        e.awake_ms     = static_cast<std::uint16_t>(std::min<std::int64_t>(now_ms(), 0xFFFF));
+        e.cause        = cold_boot ? static_cast<std::uint8_t>(100 + esp_reset_reason()) : static_cast<std::uint8_t>(cause);
+        e.flags        = (touch_latched ? kWlTouchLatch : 0) |
+                  ((ext1_status & (1ULL << m5sw::board::kTouchIrq)) != 0 ? kWlExt1Touch : 0) |
+                  ((ext1_status & kKeyWakeMask) != 0 ? kWlExt1Key : 0) | (pm1_irq_level == 0 ? kWlPm1IrqLow : 0) |
+                  (quick_armed ? kWlQuickArmed : 0) | (fallback_timer_wake ? kWlReinit : 0) |
+                  (g_shown ? kWlShown : 0) | (false_wake ? kWlFalse : 0);
+        wake_log_add(e);
+        s_sleep_start_rc_us = rc_now_us();
+    }
     if (false_wake) s_false_awake_ms += now_ms();
     // タイマーが動いていたら、終わる時刻に起きる（寝る前に 1 秒待つ分を引く）。
     std::int64_t sleep_us = static_cast<std::int64_t>(kTimerFallbackUs);

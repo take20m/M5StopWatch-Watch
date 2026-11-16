@@ -4,6 +4,7 @@
 
 #include "driver/gpio.h"
 #include "driver/rtc_io.h"
+#include "esp_attr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "m5sw_board.hpp"
@@ -13,6 +14,7 @@ namespace m5sw::power {
 namespace {
 
 constexpr TickType_t kL2IdleSleepDelay     = pdMS_TO_TICKS(1000);
+RTC_DATA_ATTR bool s_quick_wake_armed      = false;
 constexpr TickType_t kTouchResetLowDelay   = pdMS_TO_TICKS(10);
 constexpr TickType_t kTouchResetReadyDelay = pdMS_TO_TICKS(50);
 
@@ -391,6 +393,8 @@ void arm_touch_latch()
 bool touch_latched() { return (REG_READ(RTC_GPIO_STATUS_REG) & kTouchLatchBit) != 0; }
 }  // namespace
 
+bool PowerController::quick_wake_armed() { return s_quick_wake_armed; }
+
 bool PowerController::take_touch_latch()
 {
     const bool seen = touch_latched();
@@ -459,9 +463,11 @@ PowerResult PowerController::enter_l2_quick(WakeSelection wake, std::uint64_t ti
     // 寝る前の 1 秒の待ちの間にタップされたら、すぐ起きるようにタイマーを 1ms にして寝る
     // （記録は残るので、起きた側で take_touch_latch() がタップとして扱う）。
     const TickType_t step = pdMS_TO_TICKS(20);  // 待つ間は浅い眠り（アプリ側で有効にしていれば）
+    s_quick_wake_armed    = false;
     for (TickType_t waited = 0; waited < kL2IdleSleepDelay; waited += step) {
         if (touch_wake_ && touch_latched()) {
             esp_sleep_enable_timer_wakeup(1000);
+            s_quick_wake_armed = true;
             break;
         }
         vTaskDelay(step);

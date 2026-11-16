@@ -70,6 +70,8 @@ public:
     // （約 0.17 秒）の短いタップを取りこぼしていた。この記録は寝ている間も残る。
     // 記録を読んで消し、普通の GPIO に戻す。起きたらすぐ（GPIO13 を設定し直す前に）呼ぶ。
     static bool take_touch_latch();
+    // 前回寝る直前の待ちでタップを見つけ、1ms のタイマーで寝たか（起きた側で読む。原因調べ用）。
+    static bool quick_wake_armed();
     // Applies the wake-free L2 peripheral baseline and enables PM1/IOE1 I2C
     // idle sleep, but deliberately leaves the ESP32 running.
     [[nodiscard]] PowerResult prepare_l2_active();
