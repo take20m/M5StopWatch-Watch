@@ -1286,25 +1286,40 @@ void display_task(void*)
     const std::int64_t t_data = now_ms();
     if (begun != ESP_OK) ESP_LOGE(kTag, "DISPLAY_FAIL begin error=%s", esp_err_to_name(begun));
 
+    lgfx::LovyanGFX* gfx = panel.canvas();
+    FaceData frame         = data;
+    FaceState face_state;
+    auto epoch_now = [&]() -> std::int64_t {
+        return data.time_valid ? data.epoch + (now_ms() - epoch_at_ms) / 1000 : kNoEpoch;
+    };
+#if WATCH_HAS_CHARACTER
+    if (begun == ESP_OK) {
+        const int hour = data.time_valid ? utc_from_epoch(epoch_now() + kJstOffsetSec).tm_hour : 12;
+        s_character_index = character_for_hour(hour, s_character_index);
+    }
+#endif
+    // 見ていると決まる前に、時計の文字盤を書いて送っておく（明るさ 0 のままなので見えない）。
+    // 決まったら、変わった行だけ送り直して光らせる。判定を待つ間に描画と転送（約 70ms）を済ませる。
+    bool predrawn = false;
+    if (begun == ESP_OK && job.command == DisplayCommand::none && !timer_due() && !s_app.tm_alarm &&
+        screen_for_show(epoch_now()) == Screen::clock) {
+        DirtyRows pre;
+        if (frame.time_valid) frame.epoch = epoch_now();
+        draw_face(gfx, frame, &face_state, &pre);
+        predrawn = panel.push_rows(pre.y0, pre.y1) == ESP_OK;
+        if (!predrawn) face_state = FaceState{};
+    }
+    const std::int64_t t_pre = now_ms();
+
     while (job.command == DisplayCommand::none) vTaskDelay(pdMS_TO_TICKS(5));
 
     if (begun == ESP_OK && job.command == DisplayCommand::show) {
         const ShowMode mode = job.mode;
-        lgfx::LovyanGFX* gfx = panel.canvas();
-        FaceData frame         = data;
-        if (frame.time_valid) frame.epoch += (now_ms() - epoch_at_ms) / 1000;
-        FaceState face_state;
         DirtyRows dirty;
-        auto epoch_now = [&]() -> std::int64_t {
-            return data.time_valid ? data.epoch + (now_ms() - epoch_at_ms) / 1000 : kNoEpoch;
-        };
         if (timer_due()) timer_start_alarm();
         Screen screen              = screen_for_show(epoch_now());
+        if (predrawn && screen != Screen::clock) face_state = FaceState{};  // 別の画面になったら全体を描き直す
 #if WATCH_HAS_CHARACTER
-        {
-            const int hour = data.time_valid ? utc_from_epoch(epoch_now() + kJstOffsetSec).tm_hour : 12;
-            s_character_index = character_for_hour(hour, s_character_index);
-        }
         std::int64_t jump_from_ms = 0;
         int char_offset           = 0;
 #endif
@@ -1324,12 +1339,12 @@ void display_task(void*)
         const std::int64_t t_draw0 = now_ms();
         draw_current(&dirty);
         const std::int64_t t_draw1 = now_ms();
-        const esp_err_t pushed = panel.push_rows(dirty.y0, dirty.y1);
+        const esp_err_t pushed = dirty.empty() ? ESP_OK : panel.push_rows(dirty.y0, dirty.y1);
         const std::int64_t t_push = now_ms();
         (void)panel.set_brightness_percent(kBrightness);  // 時計を書いてから光らせる
         pm_apply(kCpuMhzIdle, false);
-        ESP_LOGI(kTag, "FRAME_TIMING cmd_wait_end=%lld draw=%lldms push=%lldms", t_draw0, t_draw1 - t_draw0,
-                 t_push - t_draw1);
+        ESP_LOGI(kTag, "FRAME_TIMING predrawn=%d pre_end=%lld cmd_wait_end=%lld draw=%lldms push=%lldms", predrawn,
+                 t_pre, t_draw0, t_draw1 - t_draw0, t_push - t_draw1);
         if (pushed != ESP_OK) ESP_LOGW(kTag, "PUSH_FAIL error=%s", esp_err_to_name(pushed));
         const std::int64_t first_frame_ms = now_ms();
         ESP_LOGI(kTag, "SHOW %s wake->frame %lldms (display start=%lld ready=%lld data=%lld) time=%s bat=%umV(%d%%)",
