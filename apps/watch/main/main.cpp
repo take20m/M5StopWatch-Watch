@@ -1324,7 +1324,7 @@ void draw_app(lgfx::LovyanGFX* gfx, Screen screen, std::int64_t us, bool running
         if (alarm) {
             gfx->drawString("Press any button", kCenterX, kPillY);
         } else {
-            gfx->drawString(sw ? "Hold B to reset" : "Tap to change  \xC2\xB7  Hold B to reset", kCenterX, kHintY);
+            gfx->drawString(sw ? "Hold to reset" : "Tap to change  \xC2\xB7  Hold to reset", kCenterX, kHintY);
         }
     }
     if (!alarm && (full || st->running != static_cast<int>(running))) {
@@ -1417,9 +1417,9 @@ void draw_qr(lgfx::LovyanGFX* gfx, DirtyRows* dirty)
     dirty->add(0, gfx->height() - 1);
 }
 
-// タッチした位置を読む（CST820。0x02 = 触れている指の数、0x03〜0x06 = X と Y の 12bit）。
+// タッチした位置と、触れている指の数を読む（CST820。0x02 = 指の数、0x03〜0x06 = X と Y の 12bit）。
 // 指を離した直後でも最後の位置が残っているので、指の数が 0 でも位置が 0 でなければ使う。
-bool read_touch_point(i2c_bus_handle_t bus, int* x, int* y)
+bool read_touch(i2c_bus_handle_t bus, int* x, int* y, int* fingers)
 {
     i2c_bus_device_handle_t touch = i2c_bus_device_create(bus, m5sw::board::kTouchAddress, 400000);
     if (touch == nullptr) return false;
@@ -1427,8 +1427,9 @@ bool read_touch_point(i2c_bus_handle_t bus, int* x, int* y)
     const esp_err_t err = i2c_bus_read_bytes(touch, 0x01, sizeof(b), b);
     i2c_bus_device_delete(&touch);
     if (err != ESP_OK) return false;
-    *x = ((b[2] & 0x0F) << 8) | b[3];
-    *y = ((b[4] & 0x0F) << 8) | b[5];
+    *fingers = b[1] & 0x0F;
+    *x       = ((b[2] & 0x0F) << 8) | b[3];
+    *y       = ((b[4] & 0x0F) << 8) | b[5];
     return (*x != 0 || *y != 0) && *x < 466 && *y < 466;
 }
 
@@ -1591,6 +1592,10 @@ void display_task(void*)
         s_touch_edges            = 0;
         int touch_irqs           = 0;
         std::int64_t next_tap_ms = 0;
+        bool app_touch             = false;  // ストップウォッチ・タイマーで触れている途中
+        bool touch_long_done       = false;
+        std::int64_t touch_down_ms = 0;
+        int touch_x = -1, touch_y = -1;
         // 充電中の常時表示。普段の表示が終わる時点で USB が挿さっていて夜でなければ、消さずに暗い画面へ移る。
         // タップやボタンで普段の明るさに戻し、操作が終わればまた暗い画面に戻る。
         std::int64_t dock_from_ms  = 0;
@@ -1725,36 +1730,26 @@ void display_task(void*)
                     dock_lit = true;
                 }
             }
+            // ストップウォッチ・タイマーでは、触れた位置を覚えておき、離したときに画面のボタン（Next / Start など）を押した
+            // ことにする。0.7 秒触れ続けたらリセット（B の長押しと同じ）。ほかの画面は触れた瞬間に動かす。
+            const bool app_screen = !s_app.tm_alarm && (screen == Screen::stopwatch || screen == Screen::timer);
             if (s_touch_edges != 0) {
                 touch_irqs += s_touch_edges;
                 s_touch_edges = 0;
-                if (now_ms() >= next_tap_ms) {
+                if (!app_touch && now_ms() >= next_tap_ms) {
                     next_tap_ms = now_ms() + 400;
                     interacted();
-                    // ストップウォッチ・タイマーでは、画面のボタン（Next / Start など）を押したかを座標で見る
-                    int tx = -1, ty = -1;
-                    int pill = 0;
-                    if (!s_app.tm_alarm && (screen == Screen::stopwatch || screen == Screen::timer)) {
-                        const bool got = read_touch_point(job.bus, &tx, &ty);
-                        pill           = got ? pill_at(tx, ty) : 0;
-                        ESP_LOGI(kTag, "TOUCH x=%d y=%d got=%d pill=%d screen=%d", tx, ty, got, pill,
-                                 static_cast<int>(screen));
-                    }
-                    if (pill == 1) {
-                        go_screen(static_cast<Screen>((static_cast<int>(screen) + 1) % kScreenCount));
-                    } else if (pill == 2) {
-                        if (screen == Screen::stopwatch) {
-                            stopwatch_toggle(epoch_now());
-                        } else {
-                            timer_toggle(epoch_now());
-                        }
+                    if (app_screen) {
+                        int fingers    = 0;
+                        const bool got = read_touch(job.bus, &touch_x, &touch_y, &fingers);
+                        if (!got) touch_x = touch_y = -1;
+                        app_touch       = true;
+                        touch_down_ms   = now_ms();
+                        touch_long_done = false;
+                        ESP_LOGI(kTag, "TOUCH down x=%d y=%d got=%d fingers=%d screen=%d", touch_x, touch_y, got,
+                                 fingers, static_cast<int>(screen));
                     } else if (s_app.tm_alarm) {
                         stop_alarm();
-                    } else if (screen == Screen::timer) {
-                        if (!s_app.tm_running) {
-                            s_app.tm_preset  = (s_app.tm_preset + 1) % kTimerPresetCount;
-                            s_app.tm_left_us = 0;
-                        }
                     } else if (screen == Screen::clock) {
 #if WATCH_HAS_CHARACTER
                         s_character_index = character_any(s_character_index);
@@ -1762,6 +1757,43 @@ void display_task(void*)
                         char_offset       = INT32_MIN;  // 描き直す
                         if (kTapSound) watch::audio_play(job.bus, watch::Sound::tap);
 #endif
+                    }
+                }
+            }
+            if (app_touch) {
+                int x = 0, y = 0, fingers = 0;
+                const bool still = read_touch(job.bus, &x, &y, &fingers) && fingers > 0;
+                if (still && !touch_long_done && now_ms() - touch_down_ms >= kLongPressMs) {
+                    touch_long_done = true;
+                    interacted();
+                    if (screen == Screen::stopwatch) {
+                        stopwatch_reset();
+                    } else if (screen == Screen::timer) {
+                        timer_reset();
+                    }
+                    (void)watch::set_vibration(job.bus, true);  // リセットしたことを短い振動で知らせる
+                    vTaskDelay(pdMS_TO_TICKS(40));
+                    (void)watch::set_vibration(job.bus, false);
+                    ESP_LOGI(kTag, "TOUCH hold reset screen=%d", static_cast<int>(screen));
+                }
+                if (!still) {
+                    app_touch   = false;
+                    next_tap_ms = now_ms() + 300;  // 離したときの割り込みを新しいタッチと数えない
+                    if (!touch_long_done && app_screen) {
+                        const int pill = pill_at(touch_x, touch_y);
+                        ESP_LOGI(kTag, "TOUCH up held=%lldms pill=%d", now_ms() - touch_down_ms, pill);
+                        if (pill == 1) {
+                            go_screen(static_cast<Screen>((static_cast<int>(screen) + 1) % kScreenCount));
+                        } else if (pill == 2) {
+                            if (screen == Screen::stopwatch) {
+                                stopwatch_toggle(epoch_now());
+                            } else {
+                                timer_toggle(epoch_now());
+                            }
+                        } else if (screen == Screen::timer && !s_app.tm_running) {
+                            s_app.tm_preset  = (s_app.tm_preset + 1) % kTimerPresetCount;
+                            s_app.tm_left_us = 0;
+                        }
                     }
                 }
             }
