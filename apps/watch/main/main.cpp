@@ -1165,8 +1165,8 @@ void draw_face(lgfx::LovyanGFX* gfx, const FaceData& data, FaceState* state, Dir
     }
 
     // 電池（上、iPhone 風）。塗りつぶした電池の中に数字と（充電中は）稲妻を入れる。表示中は変えないので最初の 1 回だけ描く。
-    // 残量の色は、充電中は緑、20% 以下は赤、それ以外は白。中の文字は、残量の上では黒、空の部分では白で描き分ける
-    // （2026-11-18 iOS 26 の表示に寄せた）。
+    // 残量の色は、充電中は緑、20% 以下は赤、それ以外は白。中の数字と稲妻は白字。ただし白い残量の上だけは読めるように黒字にする
+    // （2026-11-18 iOS 26 の表示に寄せ、緑の上も白字が良いとの要望で調整）。
     if (full && data.battery_percent >= 0) {
         const int pct = std::min(100, std::max(0, data.battery_percent));
         constexpr int kW = 74, kH = 32, kR = 10, kY = kBatteryY;  // 電池の外形
@@ -1198,7 +1198,7 @@ void draw_face(lgfx::LovyanGFX* gfx, const FaceData& data, FaceState* state, Dir
         if (fill_w > 0) {
             gfx->setClipRect(x, kY, fill_w, kH);
             gfx->fillRoundRect(x, kY, kW, kH, kR, level);
-            draw_content(TFT_BLACK);
+            draw_content(level == TFT_WHITE ? TFT_BLACK : TFT_WHITE);  // 白い残量の上だけ黒字にする
         }
         if (fill_w < kW) {
             gfx->setClipRect(x + fill_w, kY, kW - fill_w, kH);
