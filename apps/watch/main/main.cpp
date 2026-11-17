@@ -77,7 +77,7 @@ constexpr int kNightFromHour            = 1;    // この時間帯（日本時�
 constexpr int kNightToHour              = 6;
 constexpr std::uint16_t kUsbVinMv       = 4000; // USB の電圧がこれ以上なら「挿さっている」
 // 充電中（USB 給電中）は、夜以外は暗い時刻の画面を出し続ける（置き時計。2026-11-18）。
-constexpr std::uint8_t kDockBrightness  = 10;   // %
+constexpr std::uint8_t kDockBrightness  = 20;   // %（10 では暗いとのことで上げた。2026-11-18）
 constexpr int kDockCheckMs              = 1000;   // USB が抜けたか・夜になったかを見る間隔
 constexpr int kDockBatteryMs            = 60000;  // 電池の表示を読み直す間隔
 constexpr int kCenterX                  = 234;  // 表示領域 468x466 の中心
