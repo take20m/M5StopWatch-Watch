@@ -1164,31 +1164,37 @@ void draw_face(lgfx::LovyanGFX* gfx, const FaceData& data, FaceState* state, Dir
         dirty->add(0, gfx->height() - 1);
     }
 
-    // 電池（上、iPhone 風）。角の丸い電池の形の中に残量の数字を入れる。表示中は変えないので最初の 1 回だけ描く。
+    // 電池（上、iPhone 風）。「51%」の数字、縁取りした電池の形、充電中は稲妻。表示中は変えないので最初の 1 回だけ描く。
+    // 残量の色は、充電中は緑、20% 以下は赤、それ以外は白（2026-11-17 iPhone の表示に寄せた）。
     if (full && data.battery_percent >= 0) {
         const int pct = std::min(100, std::max(0, data.battery_percent));
-        constexpr int kW = 46, kH = 22, kR = 7, kY = kBatteryY;
-        const int left            = kCenterX - (kW + 4) / 2;
+        constexpr int kW = 44, kH = 22, kR = 7, kY = kBatteryY;  // 電池の外形
+        constexpr int kInset = 3, kNubW = 3, kGap = 7, kBoltW = 12;
+        constexpr std::uint16_t kOutline = 0x7BEF;  // 灰色の縁と端子
         const bool low            = pct <= 20;
-        const std::uint16_t body  = 0x4A69;                       // 暗い灰色（空の部分）
-        // 残量（充電中は緑、少ないと赤）
-        const std::uint16_t level = data.charging ? 0x37E6 : (low ? 0xF8A6 : TFT_WHITE);
-        gfx->fillRoundRect(left, kY, kW, kH, kR, body);
-        const int fill_w = kW * pct / 100;
-        if (fill_w > 0) {
-            // 残量の部分だけを塗る（右端は丸めない）
-            gfx->setClipRect(left, kY, fill_w, kH);
-            gfx->fillRoundRect(left, kY, kW, kH, kR, level);
-            gfx->clearClipRect();
-        }
-        gfx->fillRoundRect(left + kW + 2, kY + 7, 3, kH - 14, 1, body);  // 端子
+        const std::uint16_t level = data.charging ? 0x662C : (low ? 0xF8A6 : TFT_WHITE);
         char text[8] = {};
-        std::snprintf(text, sizeof(text), "%d", pct);
-        gfx->loadFont(kFontBattery);
-        gfx->setTextDatum(lgfx::textdatum_t::middle_center);
-        // 数字は背景を描かずに重ねる（残量の白と空の灰色にまたがるので）
-        gfx->setTextColor(low && !data.charging ? TFT_WHITE : TFT_BLACK);
-        gfx->drawString(text, left + kW / 2, kY + kH / 2 + 1);
+        std::snprintf(text, sizeof(text), "%d%%", pct);
+        gfx->loadFont(kFontBatteryPct);
+        const int text_w  = gfx->textWidth(text);
+        const int total_w = text_w + kGap + kW + 2 + kNubW + (data.charging ? kGap - 2 + kBoltW : 0);
+        int x             = kCenterX - total_w / 2;
+        gfx->setTextDatum(lgfx::textdatum_t::middle_left);
+        gfx->setTextColor(TFT_WHITE);
+        gfx->drawString(text, x, kY + kH / 2 + 1);
+        x += text_w + kGap;
+        gfx->drawRoundRect(x, kY, kW, kH, kR, kOutline);
+        gfx->drawRoundRect(x + 1, kY + 1, kW - 2, kH - 2, kR - 1, kOutline);
+        const int inner_w = kW - 2 * kInset;
+        const int fill_w  = std::max(pct > 0 ? 2 : 0, inner_w * pct / 100);
+        if (fill_w > 0) gfx->fillRoundRect(x + kInset, kY + kInset, fill_w, kH - 2 * kInset, 3, level);
+        gfx->fillRoundRect(x + kW + 2, kY + 7, kNubW, kH - 14, 1, kOutline);  // 端子
+        x += kW + 2 + kNubW + kGap - 2;
+        if (data.charging) {
+            // 稲妻（2 つの三角形）
+            gfx->fillTriangle(x + 8, kY, x, kY + 13, x + 7, kY + 13, TFT_WHITE);
+            gfx->fillTriangle(x + 5, kY + 9, x + kBoltW, kY + 9, x + 3, kY + kH, TFT_WHITE);
+        }
     }
 
 #if WATCH_HAS_CHARACTER
