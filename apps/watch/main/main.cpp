@@ -85,7 +85,8 @@ constexpr std::uint16_t kColorDate      = 0xC618;  // 明るい灰色
 // 文字盤の縦の配置。キャラクターがあるときは時刻を上に寄せ、下にキャラクターを置く。
 #if WATCH_HAS_CHARACTER
 // 2026-11-15 動画 IMG_0078 で日付と秒の端が削れていたので、PC で配置を再現して決め直した。
-constexpr int kBatteryY   = 28;
+// 電池（高さ 32px）の下端が、日付の枠の黒塗り（y=57 から）で 3 行削れていたので 4px 上げた（2026-11-18 写真 IMG_0099）。
+constexpr int kBatteryY   = 24;
 constexpr int kDateY      = 80;
 constexpr int kTimeY      = 168;  // 数字の中心
 constexpr int kSecY       = 244;
