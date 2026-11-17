@@ -53,7 +53,7 @@ constexpr TickType_t kLogFlushWait = pdMS_TO_TICKS(50);  // ログを USB に流
 
 // ---- 起こし方 ----
 constexpr std::uint8_t kAnyDuration      = 2;    // any-motion: 40ms 続く
-constexpr std::uint8_t kAnyThreshold     = 100;  // 約 48mg 以上の変化
+constexpr std::uint8_t kAnyThreshold     = 150;  // 約 72mg 以上の変化（100 では着けているだけで 1 時間に 1300 回空振りした。2026-11-17）
 // 保険のタイマー。v2/v3 で「寝たまま起きなくなる」ことがあったので、調査中は 1 分にして、
 // 起きたら起床経路の状態をログに出し、動き検出を設定し直す（落ち着いたら 1 時間に戻す）。
 constexpr std::uint64_t kTimerFallbackUs = 3600ULL * 1000 * 1000;  // 1 時間（電池の記録も兼ねる）

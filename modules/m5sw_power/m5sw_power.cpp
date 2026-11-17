@@ -466,11 +466,19 @@ PowerResult PowerController::enter_l2_quick(WakeSelection wake, std::uint64_t ti
     s_quick_wake_armed    = false;
     for (TickType_t waited = 0; waited < kL2IdleSleepDelay; waited += step) {
         if (touch_wake_ && touch_latched()) {
-            esp_sleep_enable_timer_wakeup(1000);
             s_quick_wake_armed = true;
             break;
         }
         vTaskDelay(step);
+    }
+    // タイマー起床は寝る直前に設定し直す。待ちの間の自動ライトスリープ（esp_pm）が、毎回
+    // esp_sleep_enable_timer_wakeup() を次の tick までの短い時間で上書きするため、そのままだと
+    // ディープスリープが数十 ms で終わる（2026-11-17: 動かさずに置くと 1.1 秒ごとに起き続けていた）。
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+    if (s_quick_wake_armed) {
+        esp_sleep_enable_timer_wakeup(1000);
+    } else if (timer_fallback_us > 0) {
+        esp_sleep_enable_timer_wakeup(timer_fallback_us);
     }
     esp_deep_sleep_start();
     return {ESP_FAIL, ESP_FAIL};
