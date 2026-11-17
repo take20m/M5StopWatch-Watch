@@ -1180,7 +1180,7 @@ void draw_face(lgfx::LovyanGFX* gfx, const FaceData& data, FaceState* state, Dir
     if (full && data.battery_percent >= 0) {
         const int pct = std::min(100, std::max(0, data.battery_percent));
         constexpr int kW = 74, kH = 32, kR = 10, kY = kBatteryY;  // 電池の外形
-        constexpr int kNubW = 4, kNubH = 12, kBoltW = 11, kBoltGap = 2;
+        constexpr int kNubW = 4, kNubH = 12, kBoltW = 9, kBoltH = 15, kBoltGap = 2;  // 稲妻（11x19 から少し小さくした。2026-11-18）
         constexpr std::uint16_t kBody = 0x4A69;  // 空の部分と端子の灰色
         const bool low            = pct <= 20;
         const std::uint16_t level = data.charging ? 0x662C : (low ? 0xF8A6 : TFT_WHITE);
@@ -1203,9 +1203,9 @@ void draw_face(lgfx::LovyanGFX* gfx, const FaceData& data, FaceState* state, Dir
             gfx->drawString(text, cx, top + kDigitH);
             if (data.charging) {
                 // 稲妻（2 つの三角形）
-                const int bx = cx + text_w + kBoltGap, t = top;  // 数字と同じ高さ
-                gfx->fillTriangle(bx + 7, t, bx, t + 11, bx + 6, t + 11, color);
-                gfx->fillTriangle(bx + 5, t + 8, bx + kBoltW, t + 8, bx + 3, t + kDigitH, color);
+                const int bx = cx + text_w + kBoltGap, t = top + (kDigitH - kBoltH) / 2;  // 数字の高さの中央
+                gfx->fillTriangle(bx + 6, t, bx, t + 9, bx + 5, t + 9, color);
+                gfx->fillTriangle(bx + 4, t + 6, bx + kBoltW, t + 6, bx + 3, t + kBoltH, color);
             }
         };
         if (fill_w > 0) {
