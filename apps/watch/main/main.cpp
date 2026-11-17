@@ -52,7 +52,7 @@ constexpr char kTag[]              = "watch";
 constexpr TickType_t kLogFlushWait = pdMS_TO_TICKS(50);  // ログを USB に流し切るための待ち
 
 // ---- 起こし方 ----
-constexpr std::uint8_t kAnyDuration      = 2;    // any-motion: 40ms 続く
+constexpr std::uint8_t kAnyDuration      = 3;    // any-motion: 60ms 続く（40ms から。腕を上げる動きは数百 ms 続くので、短い揺れだけを落とす。2026-11-18 推測で）
 constexpr std::uint8_t kAnyThreshold     = 150;  // 約 72mg 以上の変化（100 では着けているだけで 1 時間に 1300 回空振りした。2026-11-17）
 // 保険のタイマー。v2/v3 で「寝たまま起きなくなる」ことがあったので、調査中は 1 分にして、
 // 起きたら起床経路の状態をログに出し、動き検出を設定し直す（落ち着いたら 1 時間に戻す）。
@@ -61,9 +61,9 @@ constexpr std::uint64_t kKeyWakeMask     = (1ULL << m5sw::board::kKey1) | (1ULL 
 
 // ---- 画面 ----
 constexpr bool kTapSound               = false;  // タップで音を鳴らす（音はユーザーが用意するまで止めておく。2026-11-15）
-constexpr std::uint8_t kBrightness      = 50;        // %（60 から下げた。2026-11-16 省電力）
-constexpr std::int64_t kLookShowMaxUs   = 8000000;   // 見続けていても 8 秒で消す
-constexpr std::int64_t kLookMinShowUs   = 2500000;   // 手首で点けたら、腕を下ろしてもこの時間は消さない
+constexpr std::uint8_t kBrightness      = 40;        // %（60→50→40。2026-11-18 省電力、推測で）
+constexpr std::int64_t kLookShowMaxUs   = 6000000;   // 見続けていても 6 秒で消す（8 秒から。2026-11-18 省電力）
+constexpr std::int64_t kLookMinShowUs   = 2000000;   // 手首で点けたら、腕を下ろしてもこの時間は消さない（2.5 秒から）
 constexpr std::int64_t kButtonShowUs    = 4000000;   // ボタンで点けたときは 4 秒（押すたびに延長）
 constexpr std::int64_t kColdBootShowUs  = 5000000;
 constexpr std::int32_t kJstOffsetSec    = 9 * 3600;
@@ -119,8 +119,8 @@ constexpr float kStillTolerance     = 0.15f;
 constexpr std::int64_t kWindowUs    = 1500000;
 constexpr int kSmoothFrames         = 5;
 constexpr int kLookHoldFrames       = 3;   // 60ms（v1 は 200ms、7=140ms、4=80ms から速さのためさらに短くした）
-constexpr int kAwayHoldFrames       = 25;  // 500ms
-constexpr int kViewEndFrames        = 25;  // 500ms
+constexpr int kAwayHoldFrames       = 15;  // 300ms（500ms から。空振りの起床を早く切り上げる。2026-11-18）
+constexpr int kViewEndFrames        = 15;  // 300ms（500ms から。腕を下ろしたら早く消す。2026-11-18）
 constexpr float kRaiseMinDeg        = 25.0f;
 constexpr int kRaiseSkipFrames      = 10;
 constexpr int kRaiseLookbackFrames  = 100;
