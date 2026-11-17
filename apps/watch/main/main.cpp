@@ -1001,6 +1001,7 @@ struct FaceData {
     std::int64_t epoch  = 0;  // UTC
     int battery_percent = -1;
     std::uint16_t battery_mv = 0;
+    bool charging            = false;  // USB が挿さっている（PM1 からは充電中かを直接読めないので、給電の有無で見る）
 };
 
 int battery_percent_from_mv(std::uint16_t mv)
@@ -1170,7 +1171,8 @@ void draw_face(lgfx::LovyanGFX* gfx, const FaceData& data, FaceState* state, Dir
         const int left            = kCenterX - (kW + 4) / 2;
         const bool low            = pct <= 20;
         const std::uint16_t body  = 0x4A69;                       // 暗い灰色（空の部分）
-        const std::uint16_t level = low ? 0xF8A6 : TFT_WHITE;    // 残量（少ないと赤）
+        // 残量（充電中は緑、少ないと赤）
+        const std::uint16_t level = data.charging ? 0x37E6 : (low ? 0xF8A6 : TFT_WHITE);
         gfx->fillRoundRect(left, kY, kW, kH, kR, body);
         const int fill_w = kW * pct / 100;
         if (fill_w > 0) {
@@ -1185,7 +1187,7 @@ void draw_face(lgfx::LovyanGFX* gfx, const FaceData& data, FaceState* state, Dir
         gfx->loadFont(kFontBattery);
         gfx->setTextDatum(lgfx::textdatum_t::middle_center);
         // 数字は背景を描かずに重ねる（残量の白と空の灰色にまたがるので）
-        gfx->setTextColor(low ? TFT_WHITE : TFT_BLACK);
+        gfx->setTextColor(low && !data.charging ? TFT_WHITE : TFT_BLACK);
         gfx->drawString(text, left + kW / 2, kY + kH / 2 + 1);
     }
 
@@ -1339,6 +1341,7 @@ void display_task(void*)
         data.battery_mv      = mv;
         data.battery_percent = battery_percent_from_mv(mv);
     }
+    data.charging = s_usb_power;
     const std::int64_t t_data = now_ms();
     if (begun != ESP_OK) ESP_LOGE(kTag, "DISPLAY_FAIL begin error=%s", esp_err_to_name(begun));
 
