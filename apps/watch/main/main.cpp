@@ -1007,7 +1007,7 @@ struct FaceData {
     int battery_percent = -1;
     std::uint16_t battery_mv = 0;
     bool charging            = false;  // USB が挿さっている（PM1 からは充電中かを直接読めないので、給電の有無で見る）
-    bool dock                = false;  // 充電中の常時表示（秒とキャラクターを出さない）
+    bool dock                = false;  // 充電中の常時表示（秒を出さない。キャラクターは出す。2026-11-18）
 };
 
 int battery_percent_from_mv(std::uint16_t mv)
@@ -1217,7 +1217,7 @@ void draw_face(lgfx::LovyanGFX* gfx, const FaceData& data, FaceState* state, Dir
     }
 
 #if WATCH_HAS_CHARACTER
-    if (full && !data.dock) draw_character(gfx, s_character_index, dirty);
+    if (full) draw_character(gfx, s_character_index, dirty);
 #endif
 
     if (!data.time_valid) {
