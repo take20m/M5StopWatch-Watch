@@ -1417,6 +1417,32 @@ void draw_qr(lgfx::LovyanGFX* gfx, DirtyRows* dirty)
     dirty->add(0, gfx->height() - 1);
 }
 
+// タッチした位置を読む（CST820。0x02 = 触れている指の数、0x03〜0x06 = X と Y の 12bit）。
+// 指を離した直後でも最後の位置が残っているので、指の数が 0 でも位置が 0 でなければ使う。
+bool read_touch_point(i2c_bus_handle_t bus, int* x, int* y)
+{
+    i2c_bus_device_handle_t touch = i2c_bus_device_create(bus, m5sw::board::kTouchAddress, 400000);
+    if (touch == nullptr) return false;
+    std::uint8_t b[6] = {};
+    const esp_err_t err = i2c_bus_read_bytes(touch, 0x01, sizeof(b), b);
+    i2c_bus_device_delete(&touch);
+    if (err != ESP_OK) return false;
+    *x = ((b[2] & 0x0F) << 8) | b[3];
+    *y = ((b[4] & 0x0F) << 8) | b[5];
+    return (*x != 0 || *y != 0) && *x < 466 && *y < 466;
+}
+
+// 画面のボタンのどれを押したか（0 = どれでもない、1 = 左の Next、2 = 右の Start / Stop）。
+// 指は少しずれるので、見た目より上下左右に 14px 広く取る。
+int pill_at(int x, int y)
+{
+    constexpr int kHalfGap = 9, kW = 128, kH = 52, kSlop = 14;
+    if (y < kPillY - kH / 2 - kSlop || y > kPillY + kH / 2 + kSlop) return 0;
+    if (x >= kCenterX - kHalfGap - kW - kSlop && x < kCenterX) return 1;
+    if (x >= kCenterX && x <= kCenterX + kHalfGap + kW + kSlop) return 2;
+    return 0;
+}
+
 enum class ShowMode { look, button, cold_boot, dock };
 
 // 夜（手首の動きで起きない時間帯。日本時間）か
@@ -1705,7 +1731,24 @@ void display_task(void*)
                 if (now_ms() >= next_tap_ms) {
                     next_tap_ms = now_ms() + 400;
                     interacted();
-                    if (s_app.tm_alarm) {
+                    // ストップウォッチ・タイマーでは、画面のボタン（Next / Start など）を押したかを座標で見る
+                    int tx = -1, ty = -1;
+                    int pill = 0;
+                    if (!s_app.tm_alarm && (screen == Screen::stopwatch || screen == Screen::timer)) {
+                        const bool got = read_touch_point(job.bus, &tx, &ty);
+                        pill           = got ? pill_at(tx, ty) : 0;
+                        ESP_LOGI(kTag, "TOUCH x=%d y=%d got=%d pill=%d screen=%d", tx, ty, got, pill,
+                                 static_cast<int>(screen));
+                    }
+                    if (pill == 1) {
+                        go_screen(static_cast<Screen>((static_cast<int>(screen) + 1) % kScreenCount));
+                    } else if (pill == 2) {
+                        if (screen == Screen::stopwatch) {
+                            stopwatch_toggle(epoch_now());
+                        } else {
+                            timer_toggle(epoch_now());
+                        }
+                    } else if (s_app.tm_alarm) {
                         stop_alarm();
                     } else if (screen == Screen::timer) {
                         if (!s_app.tm_running) {
