@@ -69,7 +69,8 @@ constexpr std::int64_t kColdBootShowUs  = 5000000;
 constexpr std::int32_t kJstOffsetSec    = 9 * 3600;
 // 省電力（2026-11-16）
 constexpr int kCpuMhzIdle               = 80;   // ふだんの CPU の上限
-constexpr int kCpuMhzDraw               = 160;  // 最初の 1 枚を描く間だけ上げる（点くまでを遅らせない）
+constexpr int kCpuMhzDraw               = 240;  // 最初の 1 枚を描く間だけ上げる（点くまでを遅らせない。160→240 2026-11-17）
+constexpr int kCpuMhzWifi               = 160;  // Wi-Fi の時刻合わせ
 constexpr int kCpuMhzMin                = 40;   // 何もしていないとき
 constexpr int kFrameMs                  = 40;   // 表示中の更新間隔（25fps）
 constexpr int kNightFromHour            = 1;    // この時間帯（日本時間）は手首の動きで起きない（タップとボタンだけ）
@@ -112,7 +113,7 @@ constexpr float kLookMaxY           = 0.45f;
 constexpr float kStillTolerance     = 0.15f;
 constexpr std::int64_t kWindowUs    = 1500000;
 constexpr int kSmoothFrames         = 5;
-constexpr int kLookHoldFrames       = 4;   // 80ms（v1 は 200ms、7=140ms から速さのためさらに短くした）
+constexpr int kLookHoldFrames       = 3;   // 60ms（v1 は 200ms、7=140ms、4=80ms から速さのためさらに短くした）
 constexpr int kAwayHoldFrames       = 25;  // 500ms
 constexpr int kViewEndFrames        = 25;  // 500ms
 constexpr float kRaiseMinDeg        = 25.0f;
@@ -249,7 +250,9 @@ void mark(const char* name)
 {
     if (s_mark_count < 20) s_marks[s_mark_count++] = {name, static_cast<std::int32_t>(now_ms())};
 }
-int s_pm1_wake_polls = 0;  // PM1 が応答するまでに読んだ回数（計測用）
+int s_pm1_wake_polls = 0;
+std::int64_t s_lit_ms = -1;      // 画面を光らせた時刻（起動からの ms）
+bool s_lit_predrawn  = false;  // PM1 が応答するまでに読んだ回数（計測用）
 
 void print_marks()
 {
@@ -259,7 +262,7 @@ void print_marks()
         n += snprintf(line + n, sizeof(line) - n, " %s=%ld", s_marks[i].name, static_cast<long>(s_marks[i].ms));
     }
     line[n] = 0;
-    ESP_LOGI(kTag, "TIMELINE%s pm1_polls=%d", line, s_pm1_wake_polls);
+    ESP_LOGI(kTag, "TIMELINE%s pm1_polls=%d lit=%lld predrawn=%d", line, s_pm1_wake_polls, s_lit_ms, s_lit_predrawn);
 }
 
 
@@ -400,7 +403,7 @@ void maybe_wifi_time_sync(m5sw::wakeup::RtcWakeup* rtc, bool force)
     s_last_wifi_try_epoch    = now;
     const std::int64_t start = now_ms();
     std::int64_t synced = 0, drift = 0;
-    pm_apply(kCpuMhzDraw, false);  // 早く終わらせたほうが無線の電力が少ない
+    pm_apply(kCpuMhzWifi, false);  // 早く終わらせたほうが無線の電力が少ない
     const esp_err_t err = watch::wifi_time_sync(rtc, &synced, &drift);
     pm_apply(kCpuMhzIdle, true);
     if (err == ESP_OK) {
@@ -1390,11 +1393,14 @@ void display_task(void*)
             }
         };
         const std::int64_t t_draw0 = now_ms();
-        draw_current(&dirty);
+        // 予描きした文字盤があれば、描き直さずにすぐ光らせる（秒が 1 つ古くても、次のフレームで直る）。
+        if (!(predrawn && screen == Screen::clock)) draw_current(&dirty);
         const std::int64_t t_draw1 = now_ms();
         const esp_err_t pushed = dirty.empty() ? ESP_OK : panel.push_rows(dirty.y0, dirty.y1);
         const std::int64_t t_push = now_ms();
         (void)panel.set_brightness_percent(kBrightness);  // 時計を書いてから光らせる
+        s_lit_ms       = now_ms();
+        s_lit_predrawn = predrawn;
         pm_apply(kCpuMhzIdle, false);
         ESP_LOGI(kTag, "FRAME_TIMING predrawn=%d pre_end=%lld cmd_wait_end=%lld draw=%lldms push=%lldms", predrawn,
                  t_pre, t_draw0, t_draw1 - t_draw0, t_push - t_draw1);

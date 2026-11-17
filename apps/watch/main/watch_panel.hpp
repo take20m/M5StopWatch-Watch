@@ -42,6 +42,11 @@ private:
     void* io_                 = nullptr;  // esp_lcd_panel_io_handle_t
     bool bus_ready_           = false;
     bool powered_             = false;
+    // 速い起こし方では、スリープ解除の後の表示オンを、最初に明るさを上げるときまで遅らせる
+    // （待ちの 20ms の間に文字盤を描けるように）。
+    bool display_on_pending_  = false;
+    std::int64_t sleep_out_us_ = 0;
+    esp_err_t finish_display_on();
     i2c_bus_handle_t bus_     = nullptr;
 };
 

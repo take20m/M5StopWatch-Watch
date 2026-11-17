@@ -149,10 +149,11 @@ esp_err_t WatchPanel::begin(i2c_bus_handle_t bus)
         if (err != ESP_OK) return err;
         err = send_cmd(0x11, nullptr, 0);  // スリープ解除
         if (err != ESP_OK) return err;
-        vTaskDelay(pdMS_TO_TICKS(kSleepOutWaitMs));
-        err = send_cmd(0x29, nullptr, 0);  // 表示オン（明るさは 0 のまま。絵を送ってから上げる）
-        if (err != ESP_OK) return err;
-        s_panel_asleep = false;
+        // 表示オン（0x29）は、20ms 待ってから最初に明るさを上げるときに送る（finish_display_on）。
+        // 待つ間に描画と転送を進める（2026-11-17 点灯を速く）。
+        sleep_out_us_       = esp_timer_get_time();
+        display_on_pending_ = true;
+        s_panel_asleep      = false;
         canvas_.fillScreen(TFT_BLACK);
         ESP_LOGI(kTag, "BEGIN_TIMING fast=%lldms", (esp_timer_get_time() - t0) / 1000);
         return ESP_OK;
@@ -207,9 +208,22 @@ esp_err_t WatchPanel::push_rows(int y0, int y1)
                                      static_cast<std::size_t>(y1 - y0 + 1) * kRowBytes);
 }
 
+esp_err_t WatchPanel::finish_display_on()
+{
+    if (!display_on_pending_) return ESP_OK;
+    const std::int64_t left_us = sleep_out_us_ + kSleepOutWaitMs * 1000LL - esp_timer_get_time();
+    if (left_us > 0) vTaskDelay(pdMS_TO_TICKS((left_us + 999) / 1000));
+    display_on_pending_ = false;
+    return send_cmd(0x29, nullptr, 0);  // 表示オン（明るさは 0 のまま）
+}
+
 esp_err_t WatchPanel::set_brightness_percent(std::uint8_t percent)
 {
     if (io_ == nullptr) return ESP_ERR_INVALID_STATE;
+    if (percent > 0) {
+        const esp_err_t on = finish_display_on();
+        if (on != ESP_OK) return on;
+    }
     const std::uint8_t value = static_cast<std::uint8_t>((std::min<int>(percent, 100) * 255 + 50) / 100);
     return send_cmd(0x51, &value, 1);
 }
