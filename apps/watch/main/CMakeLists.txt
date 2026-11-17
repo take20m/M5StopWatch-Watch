@@ -5,6 +5,11 @@ if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/assets/character.bin")
     list(APPEND watch_embed "assets/character.bin")
     list(APPEND watch_defs "WATCH_HAS_CHARACTER=1")
 endif()
+# QR コード画面の真ん中に出すアイコン（tools/make_icon.py で作る。ユーザーの画像なので git に入れない）
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/assets/portfolio_icon.bin")
+    list(APPEND watch_embed "assets/portfolio_icon.bin")
+    list(APPEND watch_defs "WATCH_HAS_QR_ICON=1")
+endif()
 # タップしたときの声（tools/make_voices.py で作る。これも git に入れない）
 if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/assets/voices.bin")
     list(APPEND watch_embed "assets/voices.bin")

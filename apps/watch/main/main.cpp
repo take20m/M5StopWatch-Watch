@@ -35,6 +35,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "i2c_bus.h"
+#include "lgfx/utility/lgfx_qrcode.h"
 #include "m5sw_board.hpp"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -880,10 +881,13 @@ CharacterSet character_set()
 // ---------------------------------------------------------------------------
 // ストップウォッチとタイマー（寝ている間も進む。状態は RTC メモリに置く）
 // ボタン: KEYA（GPIO2）= 次の画面、KEYB（GPIO1）= スタート／ストップ、KEYB 長押し = リセット。
-// タイマーの画面でタップすると時間を変える。
+// タイマーの画面でタップすると時間を変える。KEYA で最後に来る QR コードの画面は、ポートフォリオの URL を出す。
 // ---------------------------------------------------------------------------
-enum class Screen : int { clock = 0, stopwatch = 1, timer = 2 };
-constexpr int kScreenCount             = 3;
+enum class Screen : int { clock = 0, stopwatch = 1, timer = 2, qr = 3 };
+constexpr int kScreenCount             = 4;
+constexpr std::int64_t kQrShowUs       = 30000000;  // QR コードはスマホで読む時間がいるので 30 秒出す
+constexpr const char* kQrUrl           = "https://take20m.dev/";
+constexpr const char* kQrLabel         = "take20m.dev";
 constexpr int kTimerPresetsS[]         = {60, 180, 300, 600, 900, 1800, 3600};
 constexpr int kTimerPresetCount        = sizeof(kTimerPresetsS) / sizeof(kTimerPresetsS[0]);
 constexpr std::int64_t kAppIdleBackS   = 120;       // 止まっているアプリは 2 分さわらなければ時計に戻す
@@ -1327,6 +1331,53 @@ void draw_app(lgfx::LovyanGFX* gfx, Screen screen, std::int64_t us, bool running
     gfx->unloadFont();
 }
 
+// ---------------------------------------------------------------------------
+// QR コードの画面（ポートフォリオ）。白い角丸の地に黒い QR コード、真ん中に丸いアイコン、下に URL。
+// 真ん中をアイコンで隠すので、誤り訂正は最も強い H（約 30% まで読める）にする。アイコンは約 13%。
+// ---------------------------------------------------------------------------
+#if WATCH_HAS_QR_ICON
+extern const std::uint8_t portfolio_icon_bin_start[] asm("_binary_portfolio_icon_bin_start");
+#endif
+
+void draw_qr(lgfx::LovyanGFX* gfx, DirtyRows* dirty)
+{
+    constexpr int kVersion = 3;  // 29x29。URL（20 文字）が H で入る最小
+    constexpr int kModule  = 8;  // 1 マスの大きさ（px）
+    constexpr int kQuiet   = 2;  // 周りの余白（マス）
+    constexpr int kCy      = 213;
+    gfx->fillScreen(TFT_BLACK);
+    QRCode qr;
+    std::uint8_t buf[128];
+    static_assert(sizeof(buf) >= 106, "QR version 3 needs 106 bytes");
+    if (lgfx_qrcode_initText(&qr, buf, kVersion, ECC_HIGH, kQrUrl) != 0) {
+        dirty->add(0, gfx->height() - 1);
+        return;
+    }
+    const int code_px = qr.size * kModule;
+    const int side    = code_px + 2 * kQuiet * kModule;
+    gfx->fillRoundRect(kCenterX - side / 2, kCy - side / 2, side, side, 18, TFT_WHITE);
+    const int x0 = kCenterX - code_px / 2, y0 = kCy - code_px / 2;
+    for (int y = 0; y < qr.size; ++y) {
+        for (int x = 0; x < qr.size; ++x) {
+            if (lgfx_qrcode_getModule(&qr, x, y)) gfx->fillRect(x0 + x * kModule, y0 + y * kModule, kModule, kModule, TFT_BLACK);
+        }
+    }
+#if WATCH_HAS_QR_ICON
+    const std::uint8_t* p = portfolio_icon_bin_start;
+    if (std::memcmp(p, "ICN1", 4) == 0) {
+        const int w = p[4] | (p[5] << 8), h = p[6] | (p[7] << 8);
+        gfx->fillCircle(kCenterX, kCy, w / 2 + 4, TFT_WHITE);  // アイコンの周りに白いふち
+        gfx->pushImage(kCenterX - w / 2, kCy - h / 2, w, h, reinterpret_cast<const lgfx::rgb565_t*>(p + 8));
+    }
+#endif
+    gfx->loadFont(kFontQrUrl);
+    gfx->setTextDatum(lgfx::textdatum_t::middle_center);
+    gfx->setTextColor(TFT_WHITE);
+    gfx->drawString(kQrLabel, kCenterX, kCy + side / 2 + 30);
+    gfx->unloadFont();
+    dirty->add(0, gfx->height() - 1);
+}
+
 enum class ShowMode { look, button, cold_boot, dock };
 
 // 夜（手首の動きで起きない時間帯。日本時間）か
@@ -1427,6 +1478,11 @@ void display_task(void*)
                 draw_face(gfx, frame, &face_state, d);
             } else if (screen == Screen::stopwatch) {
                 draw_app(gfx, screen, stopwatch_us(epoch_now()), s_app.sw_running, false, false, &face_state, d);
+            } else if (screen == Screen::qr) {
+                if (!face_state.drawn) {
+                    draw_qr(gfx, d);
+                    face_state.drawn = true;
+                }
             } else {
                 draw_app(gfx, screen, s_app.tm_alarm ? 0 : timer_left_us(epoch_now()), s_app.tm_running, s_app.tm_alarm,
                          alarm_phase, &face_state, d);
@@ -1482,7 +1538,10 @@ void display_task(void*)
             dock_from_ms  = now_ms();
             next_check_ms = now_ms() + kDockCheckMs;
             next_bat_ms   = now_ms() + kDockBatteryMs;
-            if (screen != Screen::clock && screen_for_show(epoch_now()) == Screen::clock) screen = Screen::clock;
+            if (screen == Screen::qr || (screen != Screen::clock && screen_for_show(epoch_now()) == Screen::clock)) {
+                screen       = Screen::clock;  // QR コードは暗くして出し続けない
+                s_app.screen = static_cast<int>(screen);
+            }
             frame.dock = true;
             face_state = FaceState{};
             ESP_LOGI(kTag, "DOCK on");
@@ -1507,10 +1566,12 @@ void display_task(void*)
             job.interacted       = true;
             s_app.last_use_epoch = epoch_now();
         };
+        std::int64_t qr_until_us = screen == Screen::qr ? esp_timer_get_time() + kQrShowUs : 0;
         auto go_screen = [&](Screen next) {
             screen       = next;
             s_app.screen = static_cast<int>(next);
             face_state   = FaceState{};  // 全体を描き直す
+            if (next == Screen::qr) qr_until_us = esp_timer_get_time() + kQrShowUs;
         };
         auto stop_alarm = [&]() {
             s_app.tm_alarm = false;
@@ -1531,6 +1592,7 @@ void display_task(void*)
         };
         if (s_app.tm_alarm) ESP_LOGI(kTag, "TIMER_ALARM (on wake)");
         while (true) {
+            if (screen == Screen::qr) deadline_us = std::max(deadline_us, qr_until_us);
             if (!dock) {
                 const bool lowered = job.stop && !job.interacted && !s_app.tm_alarm;
                 if (lowered || esp_timer_get_time() >= deadline_us) {
