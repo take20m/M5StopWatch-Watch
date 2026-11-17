@@ -76,6 +76,10 @@ constexpr int kFrameMs                  = 40;   // 表示中の更新間隔（25
 constexpr int kNightFromHour            = 1;    // この時間帯（日本時間）は手首の動きで起きない（タップとボタンだけ）
 constexpr int kNightToHour              = 6;
 constexpr std::uint16_t kUsbVinMv       = 4000; // USB の電圧がこれ以上なら「挿さっている」
+// 充電中（USB 給電中）は、夜以外は暗い時刻の画面を出し続ける（置き時計。2026-11-18）。
+constexpr std::uint8_t kDockBrightness  = 10;   // %
+constexpr int kDockCheckMs              = 1000;   // USB が抜けたか・夜になったかを見る間隔
+constexpr int kDockBatteryMs            = 60000;  // 電池の表示を読み直す間隔
 constexpr int kCenterX                  = 234;  // 表示領域 468x466 の中心
 constexpr int kCenterY                  = 233;
 constexpr std::uint16_t kColorDim       = 0x8410;  // 灰色
@@ -1003,6 +1007,7 @@ struct FaceData {
     int battery_percent = -1;
     std::uint16_t battery_mv = 0;
     bool charging            = false;  // USB が挿さっている（PM1 からは充電中かを直接読めないので、給電の有無で見る）
+    bool dock                = false;  // 充電中の常時表示（秒とキャラクターを出さない）
 };
 
 int battery_percent_from_mv(std::uint16_t mv)
@@ -1212,7 +1217,7 @@ void draw_face(lgfx::LovyanGFX* gfx, const FaceData& data, FaceState* state, Dir
     }
 
 #if WATCH_HAS_CHARACTER
-    if (full) draw_character(gfx, s_character_index, dirty);
+    if (full && !data.dock) draw_character(gfx, s_character_index, dirty);
 #endif
 
     if (!data.time_valid) {
@@ -1256,7 +1261,7 @@ void draw_face(lgfx::LovyanGFX* gfx, const FaceData& data, FaceState* state, Dir
     // 秒（下）
     char sec[4] = {};
     std::snprintf(sec, sizeof(sec), "%02d", local.tm_sec);
-    if (full || std::strcmp(sec, state->sec) != 0) {
+    if (!data.dock && (full || std::strcmp(sec, state->sec) != 0)) {
         gfx->loadFont(kFontSec);
         gfx->setTextColor(kColorAccent);
         gfx->setTextDatum(lgfx::textdatum_t::middle_center);
@@ -1322,7 +1327,14 @@ void draw_app(lgfx::LovyanGFX* gfx, Screen screen, std::int64_t us, bool running
     gfx->unloadFont();
 }
 
-enum class ShowMode { look, button, cold_boot };
+enum class ShowMode { look, button, cold_boot, dock };
+
+// 夜（手首の動きで起きない時間帯。日本時間）か
+bool is_night(std::int64_t epoch)
+{
+    const int hour = static_cast<int>(((epoch + kJstOffsetSec) / 3600) % 24);
+    return hour >= kNightFromHour && hour < kNightToHour;
+}
 
 // 画面はすべて専用タスク（コア 1）で扱う。電源オン・初期化・描画・消灯を同じタスクで行う
 // （v2 では初期化をコア 1、描画をコア 0 で行っていて、表示が右にずれることがあった）。
@@ -1398,6 +1410,11 @@ void display_task(void*)
         if (timer_due()) timer_start_alarm();
         Screen screen              = screen_for_show(epoch_now());
         if (predrawn && screen != Screen::clock) face_state = FaceState{};  // 別の画面になったら全体を描き直す
+        bool dock = mode == ShowMode::dock;
+        if (dock) {
+            frame.dock = true;
+            face_state = FaceState{};  // 予描きは普段の文字盤なので描き直す
+        }
 #if WATCH_HAS_CHARACTER
         std::int64_t jump_from_ms = 0;
         int char_offset           = 0;
@@ -1421,7 +1438,7 @@ void display_task(void*)
         const std::int64_t t_draw1 = now_ms();
         const esp_err_t pushed = dirty.empty() ? ESP_OK : panel.push_rows(dirty.y0, dirty.y1);
         const std::int64_t t_push = now_ms();
-        (void)panel.set_brightness_percent(kBrightness);  // 時計を書いてから光らせる
+        (void)panel.set_brightness_percent(dock ? kDockBrightness : kBrightness);  // 時計を書いてから光らせる
         s_lit_ms       = now_ms();
         s_lit_predrawn = predrawn;
         pm_apply(kCpuMhzIdle, false);
@@ -1430,12 +1447,13 @@ void display_task(void*)
         if (pushed != ESP_OK) ESP_LOGW(kTag, "PUSH_FAIL error=%s", esp_err_to_name(pushed));
         const std::int64_t first_frame_ms = now_ms();
         ESP_LOGI(kTag, "SHOW %s wake->frame %lldms (display start=%lld ready=%lld data=%lld) time=%s bat=%umV(%d%%)",
-                 mode == ShowMode::look ? "look" : (mode == ShowMode::button ? "button" : "boot"),
+                 mode == ShowMode::look ? "look" : (mode == ShowMode::button ? "button" : (dock ? "dock" : "boot")),
                  first_frame_ms - job.wake_ms, t_start, t_display, t_data, data.time_valid ? "ok" : "invalid",
                  data.battery_mv, data.battery_percent);
 
         const std::int64_t limit_us =
-            mode == ShowMode::look ? kLookShowMaxUs : (mode == ShowMode::button ? kButtonShowUs : kColdBootShowUs);
+            mode == ShowMode::look ? kLookShowMaxUs
+                                   : (mode == ShowMode::button || dock ? kButtonShowUs : kColdBootShowUs);
         std::int64_t deadline_us = esp_timer_get_time() + (s_app.tm_alarm ? kAlarmUs : limit_us);
         const char* reason       = "timeout";
         // キーは押した瞬間・離した瞬間・長押しを見る。点けたときに押されていたキー（起こしたキー）は、離すまで無視する。
@@ -1452,7 +1470,39 @@ void display_task(void*)
         s_touch_edges            = 0;
         int touch_irqs           = 0;
         std::int64_t next_tap_ms = 0;
+        // 充電中の常時表示。普段の表示が終わる時点で USB が挿さっていて夜でなければ、消さずに暗い画面へ移る。
+        // タップやボタンで普段の明るさに戻し、操作が終わればまた暗い画面に戻る。
+        std::int64_t dock_from_ms  = 0;
+        std::int64_t dock_total_ms = 0;
+        std::int64_t next_check_ms = 0;
+        std::int64_t next_bat_ms   = 0;
+        auto dock_ok = [&]() { return s_usb_power && data.time_valid && !is_night(epoch_now()); };
+        auto enter_dock = [&]() {
+            dock          = true;
+            dock_from_ms  = now_ms();
+            next_check_ms = now_ms() + kDockCheckMs;
+            next_bat_ms   = now_ms() + kDockBatteryMs;
+            if (screen != Screen::clock && screen_for_show(epoch_now()) == Screen::clock) screen = Screen::clock;
+            frame.dock = true;
+            face_state = FaceState{};
+            ESP_LOGI(kTag, "DOCK on");
+        };
+        auto leave_dock = [&]() {
+            if (!dock) return;
+            dock = false;
+            dock_total_ms += now_ms() - dock_from_ms;
+            frame.dock = false;
+            face_state = FaceState{};
+            (void)panel.set_brightness_percent(kBrightness);
+        };
+        if (dock) {
+            dock          = false;
+            dock_from_ms  = now_ms();
+            enter_dock();
+        }
+        bool dock_lit = false;  // 暗い画面を描いてから明るさを下げる（描く前に下げると古い画面が暗く見える）
         auto interacted          = [&]() {
+            leave_dock();
             deadline_us = std::max(deadline_us, esp_timer_get_time() + kButtonShowUs);
             job.interacted       = true;
             s_app.last_use_epoch = epoch_now();
@@ -1471,6 +1521,7 @@ void display_task(void*)
             }
         };
         auto start_alarm = [&]() {
+            leave_dock();
             timer_start_alarm();
             go_screen(Screen::timer);
             alarm_from_ms = now_ms();
@@ -1479,10 +1530,40 @@ void display_task(void*)
             ESP_LOGI(kTag, "TIMER_ALARM");
         };
         if (s_app.tm_alarm) ESP_LOGI(kTag, "TIMER_ALARM (on wake)");
-        while (esp_timer_get_time() < deadline_us) {
-            if (job.stop && !job.interacted && !s_app.tm_alarm) {
-                reason = "lowered";
-                break;
+        while (true) {
+            if (!dock) {
+                const bool lowered = job.stop && !job.interacted && !s_app.tm_alarm;
+                if (lowered || esp_timer_get_time() >= deadline_us) {
+                    if (!s_app.tm_alarm && dock_ok()) {
+                        enter_dock();
+                        dock_lit = false;
+                    } else {
+                        reason = lowered ? "lowered" : "timeout";
+                        break;
+                    }
+                }
+            } else if (now_ms() >= next_check_ms) {
+                next_check_ms     = now_ms() + kDockCheckMs;
+                std::uint16_t vin = 0;
+                if (job.power->read_vin_mv(&vin).ok() && vin < kUsbVinMv) {
+                    s_usb_power = false;
+                    reason      = "unplugged";
+                    break;
+                }
+                if (is_night(epoch_now())) {
+                    reason = "night";
+                    break;
+                }
+                if (now_ms() >= next_bat_ms) {
+                    next_bat_ms      = now_ms() + kDockBatteryMs;
+                    std::uint16_t mv = 0;
+                    if (job.power->read_battery_mv(&mv).ok() && mv > 0 &&
+                        battery_percent_from_mv(mv) != frame.battery_percent) {
+                        frame.battery_mv      = mv;
+                        frame.battery_percent = battery_percent_from_mv(mv);
+                        face_state            = FaceState{};  // 電池は全体を描くときだけ描くので描き直す
+                    }
+                }
             }
             if (s_app.tm_running && timer_left_us(epoch_now()) == 0) start_alarm();
             if (s_app.tm_alarm) {
@@ -1500,7 +1581,7 @@ void display_task(void*)
 #endif
                 draw_current(&changed);
 #if WATCH_HAS_CHARACTER
-                if (screen == Screen::clock) {
+                if (screen == Screen::clock && !dock) {
                     const int offset = character_offset(now_ms(), jump_from_ms);
                     if (offset != char_offset) {
                         draw_character(gfx, s_character_index, &changed, offset);
@@ -1511,6 +1592,10 @@ void display_task(void*)
                 if (!changed.empty()) {
                     const esp_err_t e = panel.push_rows(changed.y0, changed.y1);
                     if (e != ESP_OK) ESP_LOGW(kTag, "PUSH_FAIL error=%s", esp_err_to_name(e));
+                }
+                if (dock && !dock_lit) {
+                    (void)panel.set_brightness_percent(kDockBrightness);
+                    dock_lit = true;
                 }
             }
             if (s_touch_edges != 0) {
@@ -1589,8 +1674,10 @@ void display_task(void*)
         if (vibrating) (void)watch::set_vibration(job.bus, false);
         watch::audio_shutdown();
         if (s_app.tm_alarm) s_app.tm_alarm = false;  // 鳴り終わった
+        if (dock) dock_total_ms += now_ms() - dock_from_ms;
         const std::int64_t shown_ms = now_ms() - first_frame_ms;
-        s_shown_ms += shown_ms;
+        s_shown_ms += shown_ms - dock_total_ms;  // 充電中の常時表示は電池の内訳に数えない
+        if (dock_total_ms > 0) ESP_LOGI(kTag, "DOCK total %lldms", dock_total_ms);
         const esp_err_t off         = panel.sleep();
         ESP_LOGI(kTag, "HIDE after %lldms (%s) power_off=%s touch_irq_samples=%d", shown_ms, reason,
                  esp_err_to_name(off), touch_irqs);
@@ -1624,6 +1711,12 @@ void display_abort()
     if (!g_job.started) return;
     g_job.command = DisplayCommand::abort;
     display_wait_done();
+    // もう一度 display_start できるようにする（空振りのあと、充電中の常時表示を出すとき）
+    g_job.started  = false;
+    g_job.command  = DisplayCommand::none;
+    g_job.stop     = false;
+    vSemaphoreDelete(g_job.done);
+    g_job.done = nullptr;
 }
 
 // 画面を点けて文字盤を出し、消えるまで待つ。手首で点けたときは、腕を下ろしたかをメイン側で FIFO から見る。
@@ -1809,6 +1902,14 @@ extern "C" void app_main(void)
                  fifo.read_reg(0x7D), fifo.read_reg(0x49), esp_err_to_name(aps));
     }
 
+    // 充電中で画面を出さなかった起床（空振り・1 時間ごとの見回り）でも、夜でなければ常時表示に入る。
+    if (s_usb_power && !g_shown && !cold_boot) {
+        std::tm utc = {};
+        if (with_retry([&] { return rtc.read_time(&utc); }).ok() && !is_night(epoch_from_utc(utc))) {
+            ESP_LOGI(kTag, "DOCK start (usb)");
+            show_watch(&fifo, ShowMode::dock);
+        }
+    }
     mark("decided");
     wait_pm1_awake(bus);  // 判定や表示の間に PM1 が I2C の眠りに入っている（50ms のやり直し待ちを避ける）
     wake_result = with_retry([&] { return wake.clear_snapshot(snapshot); });
