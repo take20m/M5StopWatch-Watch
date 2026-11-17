@@ -37,6 +37,10 @@ def make_font(ttf, weight, px, chars):
             img = Image.new("L", (w, h), 0)
             ImageDraw.Draw(img).text((-x0, -y0), ch, font=font, fill=255, anchor="ls")
             bitmap = img.tobytes()
+        else:
+            # 空白など絵のない文字は幅も高さも 0 にする。LovyanGFX は高さ 0 でも 1 行描こうとして、
+            # 幅があると中身の決まっていないメモリを点として描いてしまう（2026-11-18 写真 IMG_0105 の点々）。
+            w = h = x0 = y0 = 0
         assert w < 256 and adv < 256, (ch, w, adv)
         glyphs.append((ord(ch), h, w, adv, -y0, x0, bitmap))
 

@@ -96,11 +96,15 @@ constexpr int kDateY      = 80;
 constexpr int kTimeY      = 168;  // 数字の中心
 constexpr int kSecY       = 244;
 constexpr int kCharacterY = 276;  // キャラクター画像の上端（160px）
+constexpr int kPillY      = 318;  // ストップウォッチ・タイマーのボタン表示（中心）
+constexpr int kHintY      = 374;
 #else
 constexpr int kBatteryY   = 58;
 constexpr int kDateY      = 138;
 constexpr int kTimeY      = kCenterY + 8;
 constexpr int kSecY       = 330;
+constexpr int kPillY      = 392;
+constexpr int kHintY      = 440;
 #endif
 
 // ---- 「時計を見ている」の判定（tests/look_wake_l2 v11 と同じ） ----
@@ -1035,6 +1039,7 @@ struct FaceState {
     char big[24]             = {};
     char small[8]            = {};
     std::uint16_t big_color  = 0;
+    int running              = -1;  // ボタン表示を描いたときの状態
 };
 
 // 文字の背景を、決まった大きさの枠で塗ってから描く（数字の幅が変わっても前の文字が残らないように）。
@@ -1275,33 +1280,67 @@ void draw_face(lgfx::LovyanGFX* gfx, const FaceData& data, FaceState* state, Dir
     gfx->unloadFont();
 }
 
-// ストップウォッチ・タイマーの画面。上に名前、真ん中に大きく時間、その下に 1/100 秒（または秒）、下に操作の説明。
+constexpr std::uint16_t rgb565(int r, int g, int b)
+{
+    return static_cast<std::uint16_t>(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+}
+
+// Apple の時計アプリ風のボタン表示（角丸の濃い地に明るい文字）。
+void draw_pill(lgfx::LovyanGFX* gfx, int cx, int cy, const char* label, std::uint16_t fill, std::uint16_t text)
+{
+    constexpr int kW = 128, kH = 52;
+    gfx->fillRoundRect(cx - kW / 2, cy - kH / 2, kW, kH, kH / 2, fill);
+    gfx->setTextColor(text);
+    gfx->drawString(label, cx, cy + 1);
+}
+
+// ストップウォッチ・タイマーの画面。上に名前、真ん中に大きく時間、その下に 1/100 秒（または秒）。
+// 下に、左右のボタン（左 = A、右 = B）の役目を Apple の時計アプリ風の丸いボタンで出し、その下に小さく補足。
+// （2026-11-18: 大文字の青い説明文が「中華製 Android っぽい」とのことで作り直した。写真 IMG_0105）
 void draw_app(lgfx::LovyanGFX* gfx, Screen screen, std::int64_t us, bool running, bool alarm, bool alarm_phase,
               FaceState* st, DirtyRows* dirty)
 {
+    constexpr std::uint16_t kGrayFill   = rgb565(0x33, 0x33, 0x36);
+    constexpr std::uint16_t kGreen      = rgb565(0x30, 0xD1, 0x58);
+    constexpr std::uint16_t kGreenFill  = rgb565(0x0E, 0x2E, 0x17);
+    constexpr std::uint16_t kRed        = rgb565(0xFF, 0x45, 0x3A);
+    constexpr std::uint16_t kRedFill    = rgb565(0x3A, 0x12, 0x10);
+    constexpr std::uint16_t kOrange     = rgb565(0xFF, 0x9F, 0x0A);
+    constexpr std::uint16_t kOrangeFill = rgb565(0x3A, 0x26, 0x00);
+    constexpr std::uint16_t kHintGray   = rgb565(0x8E, 0x8E, 0x93);
     const bool full = !st->drawn;
     const bool sw   = screen == Screen::stopwatch;
     if (full) {
         gfx->fillScreen(TFT_BLACK);
-        st->drawn = true;
+        st->drawn   = true;
+        st->running = -1;
         dirty->add(0, gfx->height() - 1);
         gfx->loadFont(kFontSmall);
         gfx->setTextDatum(lgfx::textdatum_t::middle_center);
         gfx->setTextColor(kColorAccent);
-        gfx->drawString(sw ? "STOPWATCH" : (alarm ? "DONE" : "TIMER"), kCenterX, kDateY);
+        gfx->drawString(sw ? "Stopwatch" : (alarm ? "Done" : "Timer"), kCenterX, kDateY);
         gfx->loadFont(kFontHint);
-        gfx->setTextColor(kColorDim);
+        gfx->setTextColor(kHintGray);
         if (alarm) {
-            gfx->drawString("PRESS ANY BUTTON", kCenterX, 335);
-        } else if (sw) {
-            gfx->drawString("B  START / STOP", kCenterX, 318);
-            gfx->drawString("HOLD B  RESET", kCenterX, 352);
-            gfx->drawString("A  NEXT", kCenterX, 386);
+            gfx->drawString("Press any button", kCenterX, kPillY);
         } else {
-            gfx->drawString("TAP  CHANGE TIME", kCenterX, 318);
-            gfx->drawString("B  START / STOP", kCenterX, 352);
-            gfx->drawString("HOLD B  RESET   A  NEXT", kCenterX, 386);
+            gfx->drawString(sw ? "Hold B to reset" : "Tap to change  \xC2\xB7  Hold B to reset", kCenterX, kHintY);
         }
+    }
+    if (!alarm && (full || st->running != static_cast<int>(running))) {
+        constexpr int kGap = 18;
+        gfx->fillRect(kCenterX - 128 - kGap, kPillY - 28, 2 * 128 + 2 * kGap, 56, TFT_BLACK);
+        gfx->loadFont(kFontPill);
+        gfx->setTextDatum(lgfx::textdatum_t::middle_center);
+        draw_pill(gfx, kCenterX - 64 - kGap / 2, kPillY, "Next", kGrayFill, TFT_WHITE);
+        if (running) {
+            draw_pill(gfx, kCenterX + 64 + kGap / 2, kPillY, sw ? "Stop" : "Pause", sw ? kRedFill : kOrangeFill,
+                      sw ? kRed : kOrange);
+        } else {
+            draw_pill(gfx, kCenterX + 64 + kGap / 2, kPillY, "Start", kGreenFill, kGreen);
+        }
+        st->running = running;
+        dirty->add(kPillY - 28, kPillY + 28);
     }
     // タイマーは切り上げて表示する（残り 0.4 秒は 00:01）
     const std::int64_t shown = sw ? us : (us + 999999) / 1000000 * 1000000;
