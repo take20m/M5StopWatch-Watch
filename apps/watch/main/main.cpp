@@ -1184,15 +1184,18 @@ void draw_face(lgfx::LovyanGFX* gfx, const FaceData& data, FaceState* state, Dir
         const int fill_w    = std::max(pct > 0 ? 3 : 0, kW * pct / 100);
         gfx->fillRoundRect(x, kY, kW, kH, kR, kBody);
         gfx->fillRoundRect(x + kW + 2, kY + (kH - kNubH) / 2, kNubW, kNubH, 2, kBody);  // 端子
-        gfx->setTextDatum(lgfx::textdatum_t::middle_left);
+        // 数字（Inter 26px）は基準線から上へ 19px。電池の高さの中央に来るよう基準線で置く（中央揃えの指定だと下がりすぎた）。
+        constexpr int kDigitH = 19;
+        const int top         = kY + (kH - kDigitH) / 2;
+        gfx->setTextDatum(lgfx::textdatum_t::baseline_left);
         auto draw_content = [&](std::uint16_t color) {
             gfx->setTextColor(color);
-            gfx->drawString(text, cx, kY + kH / 2 + 1);
+            gfx->drawString(text, cx, top + kDigitH);
             if (data.charging) {
                 // 稲妻（2 つの三角形）
-                const int bx = cx + text_w + kBoltGap, t = kY + 6;
+                const int bx = cx + text_w + kBoltGap, t = top;  // 数字と同じ高さ
                 gfx->fillTriangle(bx + 7, t, bx, t + 11, bx + 6, t + 11, color);
-                gfx->fillTriangle(bx + 5, t + 8, bx + kBoltW, t + 8, bx + 3, t + 20, color);
+                gfx->fillTriangle(bx + 5, t + 8, bx + kBoltW, t + 8, bx + 3, t + kDigitH, color);
             }
         };
         if (fill_w > 0) {
