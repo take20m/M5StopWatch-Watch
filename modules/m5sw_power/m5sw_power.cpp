@@ -341,6 +341,22 @@ PowerResult PowerController::enter_l0()
     return from_pm1(pm1_.shutdown());
 }
 
+PowerResult PowerController::power_off_keep_charging()
+{
+    if (!initialized_) return {ESP_ERR_INVALID_STATE, M5PM1_ERR_NOT_INIT};
+    l1_prepared_       = false;
+    l2_prepared_       = false;
+    PowerResult result = from_pm1(pm1_.disable_gpio_wake(Pm1Gpio::rtc_imu));
+    if (!result.ok()) return result;
+    result = from_pm1(pm1_.disable_gpio_wake(Pm1Gpio::port));
+    if (!result.ok()) return result;
+    result = from_pm1(pm1_.set_power_config(M5PM1_PWR_CFG_CHG_EN | M5PM1_PWR_CFG_BOOST_EN, M5PM1_PWR_CFG_CHG_EN));
+    if (!result.ok()) return result;
+    result = from_pm1(pm1_.set_ldo_hold(false));
+    if (!result.ok()) return result;
+    return from_pm1(pm1_.shutdown());
+}
+
 PowerResult PowerController::enter_l1(WakeSelection wake)
 {
     if (!l1_prepared_ || l1_prepared_wake_ != wake) {

@@ -77,6 +77,9 @@ public:
     [[nodiscard]] PowerResult prepare_l2_active();
     // Prepares L0 and issues the PM1 shutdown command; it normally does not return.
     [[nodiscard]] PowerResult enter_l0();
+    // Like L0, but leaves the charger enabled so the battery still charges while
+    // the watch is off (user "power off"). It normally does not return.
+    [[nodiscard]] PowerResult power_off_keep_charging();
     // Uses an existing matching L1 preparation when available, then issues the
     // PM1 shutdown command; it normally does not return.
     [[nodiscard]] PowerResult enter_l1(WakeSelection wake = WakeSelection::none);

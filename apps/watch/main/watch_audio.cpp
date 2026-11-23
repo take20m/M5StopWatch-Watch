@@ -22,7 +22,7 @@ namespace {
 constexpr char kTag[]             = "audio";
 constexpr int kSampleRate         = 16000;  // MCLK = 256 × 16kHz = 4.096MHz
 constexpr gpio_num_t kSpeakerPa   = GPIO_NUM_14;  // スピーカーアンプ（IOE1 の IO10 と両方 High で鳴る。UserDemo と同じ）
-constexpr std::uint8_t kVolume    = 0xB0;  // ES8311 の DAC 音量（0xBF = 0dB）
+std::uint8_t s_volume             = 0xB0;  // ES8311 の DAC 音量（0xBF = 0dB）。設定画面で変える
 
 i2c_bus_handle_t s_bus            = nullptr;
 i2c_bus_device_handle_t s_codec   = nullptr;
@@ -45,7 +45,7 @@ esp_err_t codec_init()
         {0x00, 0x00},                                                          // スレーブ
         {0x09, 0x0C}, {0x0A, 0x0C},                                            // I2S 16 ビット
         {0x14, 0x1A}, {0x16, 0x00}, {0x17, 0xC8},                              // マイク側（使わない）
-        {0x32, kVolume},
+        {0x32, s_volume},
         {0x0D, 0x01}, {0x0E, 0x02}, {0x12, 0x00}, {0x13, 0x10}, {0x1C, 0x6A}, {0x37, 0x08},
         {0x00, 0x80},                                                          // 動作開始
         {0x31, 0x00},                                                          // ミュート解除
@@ -138,6 +138,31 @@ void play_tap()
     }
 }
 
+// 「ピッ」という短い電子音（タイマーの知らせ）。
+void play_beep()
+{
+    constexpr int kMs = 120;
+    constexpr int kN  = kSampleRate * kMs / 1000;
+    static std::int16_t buf[256 * 2];
+    int filled = 0;
+    for (int i = 0; i < kN; ++i) {
+        const double env  = std::min(1.0, std::min(i, kN - 1 - i) / (0.005 * kSampleRate));
+        const auto v      = static_cast<std::int16_t>(9000.0 * env * std::sin(2 * M_PI * 1760.0 * i / kSampleRate));
+        buf[filled * 2]     = v;
+        buf[filled * 2 + 1] = v;
+        if (++filled == 256 || i == kN - 1) {
+            std::size_t written = 0;
+            i2s_channel_write(s_tx, buf, filled * 2 * sizeof(std::int16_t), &written, pdMS_TO_TICKS(200));
+            filled = 0;
+        }
+    }
+    std::memset(buf, 0, sizeof(buf));
+    for (int k = 0; k < 2; ++k) {
+        std::size_t written = 0;
+        i2s_channel_write(s_tx, buf, sizeof(buf), &written, pdMS_TO_TICKS(200));
+    }
+}
+
 #if WATCH_HAS_VOICES
 extern const std::uint8_t voices_bin_start[] asm("_binary_voices_bin_start");
 
@@ -185,8 +210,13 @@ void audio_task(void*)
         xSemaphoreTake(s_idle, portMAX_DELAY);
         if (power_up() == ESP_OK) {
             const std::int64_t t0 = esp_log_timestamp();
-            if (!play_voice()) play_tap();
-            ESP_LOGI(kTag, "PLAY tap %lums", static_cast<unsigned long>(esp_log_timestamp() - t0));
+            if (sound == Sound::beep) {
+                play_beep();
+            } else if (!play_voice()) {
+                play_tap();
+            }
+            ESP_LOGI(kTag, "PLAY %s %lums", sound == Sound::beep ? "beep" : "tap",
+                     static_cast<unsigned long>(esp_log_timestamp() - t0));
         }
         xSemaphoreGive(s_idle);
     }
@@ -203,6 +233,15 @@ void audio_play(i2c_bus_handle_t bus, Sound sound)
         xTaskCreatePinnedToCore(audio_task, "audio", 4096, nullptr, 4, nullptr, 0);
     }
     (void)xQueueSend(s_queue, &sound, 0);  // いっぱいなら捨てる（連打）
+}
+
+void audio_set_volume(std::uint8_t reg)
+{
+    s_volume = reg;
+    if (s_idle != nullptr && xSemaphoreTake(s_idle, pdMS_TO_TICKS(500)) == pdTRUE) {
+        if (s_powered) (void)codec_write(0x32, reg);
+        xSemaphoreGive(s_idle);
+    }
 }
 
 void audio_shutdown()

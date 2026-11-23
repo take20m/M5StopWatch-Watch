@@ -22,6 +22,7 @@
 #include "driver/rtc_io.h"
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
+#include "esp_app_desc.h"
 #include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_pm.h"
@@ -61,8 +62,8 @@ constexpr std::uint64_t kTimerFallbackUs = 3600ULL * 1000 * 1000;  // 1 時間�
 constexpr std::uint64_t kKeyWakeMask     = (1ULL << m5sw::board::kKey1) | (1ULL << m5sw::board::kKey2);
 
 // ---- 画面 ----
-constexpr bool kTapSound               = false;  // タップで音を鳴らす（音はユーザーが用意するまで止めておく。2026-11-15）
-constexpr std::uint8_t kBrightness      = 40;        // %（60→50→40。2026-11-18 省電力、推測で）
+// 明るさ（%）は設定画面で選ぶ。既定は 40%（60→50→40。2026-11-18 省電力、推測で）
+constexpr std::uint8_t kBrightnessOptions[] = {30, 40, 60};
 constexpr std::int64_t kLookShowMaxUs   = 6000000;   // 見続けていても 6 秒で消す（8 秒から。2026-11-18 省電力）
 constexpr std::int64_t kLookMinShowUs   = 2000000;   // 手首で点けたら、腕を下ろしてもこの時間は消さない（2.5 秒から）
 constexpr std::int64_t kButtonShowUs    = 4000000;   // ボタンで点けたときは 4 秒（押すたびに延長）
@@ -396,19 +397,19 @@ bool sync_time_from_usb(m5sw::wakeup::RtcWakeup* rtc)
 constexpr std::int64_t kWifiSyncIntervalS = 24 * 3600;
 constexpr std::int64_t kWifiRetryS        = 3600;
 
-void maybe_wifi_time_sync(m5sw::wakeup::RtcWakeup* rtc, bool force)
+esp_err_t maybe_wifi_time_sync(m5sw::wakeup::RtcWakeup* rtc, bool force)
 {
     if (!watch::wifi_time_sync_configured()) {
         if (force) ESP_LOGI(kTag, "WIFI_SYNC skipped (wifi_secrets.h not set)");
-        return;
+        return ESP_ERR_NOT_SUPPORTED;
     }
     std::tm utc = {};
     const bool rtc_ok = rtc->read_time(&utc).ok();
     const std::int64_t now = rtc_ok ? epoch_from_utc(utc) : 0;
     if (!force) {
-        if (!rtc_ok) return;
-        if (s_last_sync_epoch != 0 && now - s_last_sync_epoch < kWifiSyncIntervalS) return;
-        if (s_last_wifi_try_epoch != 0 && now - s_last_wifi_try_epoch < kWifiRetryS) return;
+        if (!rtc_ok) return ESP_ERR_INVALID_STATE;
+        if (s_last_sync_epoch != 0 && now - s_last_sync_epoch < kWifiSyncIntervalS) return ESP_OK;
+        if (s_last_wifi_try_epoch != 0 && now - s_last_wifi_try_epoch < kWifiRetryS) return ESP_OK;
     }
     s_last_wifi_try_epoch    = now;
     const std::int64_t start = now_ms();
@@ -422,6 +423,7 @@ void maybe_wifi_time_sync(m5sw::wakeup::RtcWakeup* rtc, bool force)
     }
     ESP_LOGI(kTag, "WIFI_SYNC result=%s drift=%llds took=%lldms", esp_err_to_name(err), static_cast<long long>(drift),
              now_ms() - start);
+    return err;
 }
 
 void battery_append(const BatteryRecord& rec);
@@ -455,15 +457,17 @@ std::int64_t hourly_tasks(m5sw::wakeup::RtcWakeup* rtc, m5sw::power::PowerContro
 }
 
 // 電池の記録はフラッシュ（NVS）にも残す。電池が切れると RTC メモリは消えるため。
-bool battery_nvs_open(nvs_handle_t* h, nvs_open_mode_t mode)
+bool nvs_open_ns(const char* ns, nvs_handle_t* h, nvs_open_mode_t mode)
 {
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
         err = nvs_flash_init();
     }
-    return err == ESP_OK && nvs_open("battery", mode, h) == ESP_OK;
+    return err == ESP_OK && nvs_open(ns, mode, h) == ESP_OK;
 }
+
+bool battery_nvs_open(nvs_handle_t* h, nvs_open_mode_t mode) { return nvs_open_ns("battery", h, mode); }
 
 int battery_read(nvs_handle_t h, BatteryRecord* out)
 {
@@ -887,8 +891,9 @@ CharacterSet character_set()
 // ボタン: KEYA（GPIO2）= 次の画面、KEYB（GPIO1）= スタート／ストップ、KEYB 長押し = リセット。
 // タイマーの画面でタップすると時間を変える。KEYA で最後に来る QR コードの画面は、ポートフォリオの URL を出す。
 // ---------------------------------------------------------------------------
-enum class Screen : int { clock = 0, stopwatch = 1, timer = 2, qr = 3 };
-constexpr int kScreenCount             = 4;
+enum class Screen : int { clock = 0, stopwatch = 1, timer = 2, qr = 3, settings = 4 };
+constexpr int kScreenCount             = 5;
+constexpr std::int64_t kSettingsShowUs = 20000000;  // 設定画面は最後に触ってから 20 秒出す
 constexpr std::int64_t kQrShowUs       = 30000000;  // QR コードはスマホで読む時間がいるので 30 秒出す
 constexpr const char* kQrUrl           = "https://take20m.dev/";
 constexpr const char* kQrLabel         = "take20m.dev";
@@ -915,6 +920,73 @@ struct AppState {
     bool tm_alarm               = false;
 };
 RTC_DATA_ATTR AppState s_app;
+
+// ---------------------------------------------------------------------------
+// 設定（設定画面で変える）。寝ている間は RTC メモリに、電池が切れても残るよう NVS にも書く。
+// ---------------------------------------------------------------------------
+constexpr std::uint8_t kSettingsMagic = 0x5A;
+struct Settings {
+    std::uint8_t magic      = kSettingsMagic;
+    bool dock               = true;   // 充電中の常時表示
+    bool raise              = true;   // 腕を上げて点ける
+    bool night              = true;   // 夜（1〜6 時）は腕を上げても点けない
+    std::uint8_t brightness = 1;      // kBrightnessOptions の番号（40%）
+    bool vibration          = true;   // タイマーの知らせ・長押しリセットで振動する
+    std::uint8_t sound      = 0;      // 0 = 音なし、1〜3 = 小・中・大
+};
+RTC_DATA_ATTR Settings s_set;
+bool s_settings_dirty    = false;  // この起床で変えた（寝る前に NVS に書く）
+bool s_power_off_request = false;  // 設定画面で「電源を切る」を選んだ（画面を消したあとメイン側で切る）
+constexpr std::uint8_t kVolumeRegs[] = {0, 0xA8, 0xB4, 0xBF};  // ES8311 の音量（0xBF = 0dB、1 段 0.5dB）
+constexpr const char* kSoundNames[]  = {"Off", "Low", "Medium", "High"};
+
+std::uint8_t brightness_pct() { return kBrightnessOptions[s_set.brightness % 3]; }
+
+// 設定どおりに音を鳴らす（音なしなら鳴らさない）。
+void play_sound(i2c_bus_handle_t bus, watch::Sound sound)
+{
+    if (s_set.sound == 0 || s_set.sound > 3) return;
+    watch::audio_set_volume(kVolumeRegs[s_set.sound]);
+    watch::audio_play(bus, sound);
+}
+
+// 設定どおりに振動する（短い振動。ms だけ待つ）。
+void buzz(i2c_bus_handle_t bus, int ms)
+{
+    if (!s_set.vibration) return;
+    (void)watch::set_vibration(bus, true);
+    vTaskDelay(pdMS_TO_TICKS(ms));
+    (void)watch::set_vibration(bus, false);
+}
+
+// 設定を NVS から読む（コールドブートのとき）。なければ既定のまま。
+void settings_load()
+{
+    Settings loaded;
+    nvs_handle_t h;
+    if (nvs_open_ns("settings", &h, NVS_READONLY)) {
+        size_t size = sizeof(loaded);
+        if (nvs_get_blob(h, "v1", &loaded, &size) != ESP_OK || size != sizeof(loaded) || loaded.magic != kSettingsMagic) {
+            loaded = Settings{};
+        }
+        nvs_close(h);
+    }
+    s_set = loaded;
+    ESP_LOGI(kTag, "SETTINGS dock=%d raise=%d night=%d bright=%u vib=%d sound=%u", s_set.dock, s_set.raise, s_set.night,
+             brightness_pct(), s_set.vibration, s_set.sound);
+}
+
+void settings_save()
+{
+    nvs_handle_t h;
+    if (!nvs_open_ns("settings", &h, NVS_READWRITE)) return;
+    const esp_err_t err = nvs_set_blob(h, "v1", &s_set, sizeof(s_set));
+    if (err == ESP_OK) nvs_commit(h);
+    nvs_close(h);
+    s_settings_dirty = false;
+    ESP_LOGI(kTag, "SETTINGS saved dock=%d raise=%d night=%d bright=%u vib=%d sound=%u err=%s", s_set.dock, s_set.raise,
+             s_set.night, brightness_pct(), s_set.vibration, s_set.sound, esp_err_to_name(err));
+}
 
 // 寝ている間も進む ESP32 の RTC タイマー（内蔵の発振器なので少しずれる）。
 std::int64_t rc_now_us() { return static_cast<std::int64_t>(esp_rtc_get_time_us()); }
@@ -1417,6 +1489,125 @@ void draw_qr(lgfx::LovyanGFX* gfx, DirtyRows* dirty)
     dirty->add(0, gfx->height() - 1);
 }
 
+// ---------------------------------------------------------------------------
+// 設定画面。iPhone の設定アプリ風に、濃い灰色の角丸の行を縦に並べる（丸い画面に収まるよう 1 ページ 4 行まで）。
+// 行をタップすると切り替わる。B ボタンで次のページ。
+// ---------------------------------------------------------------------------
+enum class SettingItem { dock, raise, night, brightness, vibration, sound, sync, version, battery, power_off, none };
+constexpr int kSettingsPages                        = 3;
+constexpr int kSettingsRows                         = 4;
+constexpr SettingItem kSettingsLayout[kSettingsPages][kSettingsRows] = {
+    {SettingItem::dock, SettingItem::raise, SettingItem::night, SettingItem::brightness},
+    {SettingItem::vibration, SettingItem::sound, SettingItem::sync, SettingItem::none},
+    {SettingItem::version, SettingItem::battery, SettingItem::power_off, SettingItem::none},
+};
+constexpr int kRowW = 340, kRowH = 60, kRowGap = 8, kRowTop = 112;
+
+enum class SyncState { idle, running, done, failed, no_wifi };
+
+struct SettingsView {
+    int page              = 0;
+    SyncState sync        = SyncState::idle;
+    bool confirm_off      = false;  // 「もう一度タップで電源を切る」を出している
+    std::uint16_t battery_mv = 0;
+};
+
+void draw_toggle(lgfx::LovyanGFX* gfx, int right, int cy, bool on)
+{
+    constexpr int kW = 52, kH = 30;
+    const int x = right - kW;
+    gfx->fillRoundRect(x, cy - kH / 2, kW, kH, kH / 2, on ? rgb565(0x30, 0xD1, 0x58) : rgb565(0x48, 0x48, 0x4A));
+    gfx->fillCircle(on ? x + kW - kH / 2 : x + kH / 2, cy, kH / 2 - 3, TFT_WHITE);
+}
+
+void draw_settings(lgfx::LovyanGFX* gfx, const SettingsView& view, DirtyRows* dirty)
+{
+    constexpr std::uint16_t kRowFill  = rgb565(0x1C, 0x1C, 0x1E);
+    constexpr std::uint16_t kGray     = rgb565(0x8E, 0x8E, 0x93);
+    constexpr std::uint16_t kRed      = rgb565(0xFF, 0x45, 0x3A);
+    constexpr std::uint16_t kRedFill  = rgb565(0x3A, 0x12, 0x10);
+    gfx->fillScreen(TFT_BLACK);
+    gfx->loadFont(kFontSmall);
+    gfx->setTextDatum(lgfx::textdatum_t::middle_center);
+    gfx->setTextColor(kColorAccent);
+    gfx->drawString("Settings", kCenterX, 72);
+    gfx->loadFont(kFontPill);
+    const int left = kCenterX - kRowW / 2, right = kCenterX + kRowW / 2;
+    for (int r = 0; r < kSettingsRows; ++r) {
+        const SettingItem item = kSettingsLayout[view.page % kSettingsPages][r];
+        if (item == SettingItem::none) continue;
+        const int top = kRowTop + r * (kRowH + kRowGap), cy = top + kRowH / 2;
+        if (item == SettingItem::power_off) {
+            gfx->fillRoundRect(left, top, kRowW, kRowH, 16, view.confirm_off ? kRedFill : kRowFill);
+            gfx->setTextDatum(lgfx::textdatum_t::middle_center);
+            gfx->setTextColor(kRed);
+            gfx->drawString(view.confirm_off ? "Tap Again to Power Off" : "Power Off", kCenterX, cy + 1);
+            continue;
+        }
+        gfx->fillRoundRect(left, top, kRowW, kRowH, 16, kRowFill);
+        const char* label = "";
+        char value[32]    = {};
+        int toggle        = -1;  // 0 / 1 ならスイッチを描く
+        switch (item) {
+            case SettingItem::dock: label = "Charging Display"; toggle = s_set.dock; break;
+            case SettingItem::raise: label = "Raise to Wake"; toggle = s_set.raise; break;
+            case SettingItem::night: label = "Night Mode"; toggle = s_set.night; break;
+            case SettingItem::brightness:
+                label = "Brightness";
+                std::snprintf(value, sizeof(value), "%u%%", brightness_pct());
+                break;
+            case SettingItem::vibration: label = "Vibration"; toggle = s_set.vibration; break;
+            case SettingItem::sound: label = "Sound"; std::snprintf(value, sizeof(value), "%s", kSoundNames[s_set.sound % 4]); break;
+            case SettingItem::sync: {
+                label                 = "Sync Time";
+                static const char* k[] = {"Wi-Fi", "Syncing…", "Done", "Failed", "No Wi-Fi"};
+                std::snprintf(value, sizeof(value), "%s", k[static_cast<int>(view.sync)]);
+                break;
+            }
+            case SettingItem::version: {
+                label = "Version";
+                std::snprintf(value, sizeof(value), "%.14s", esp_app_get_description()->version);
+                break;
+            }
+            case SettingItem::battery:
+                label = "Battery";
+                std::snprintf(value, sizeof(value), "%u mV  %d%%", view.battery_mv, battery_percent_from_mv(view.battery_mv));
+                break;
+            default: break;
+        }
+        gfx->setTextDatum(lgfx::textdatum_t::middle_left);
+        gfx->setTextColor(TFT_WHITE);
+        gfx->drawString(label, left + 20, cy + 1);
+        if (toggle >= 0) {
+            draw_toggle(gfx, right - 16, cy, toggle != 0);
+        } else {
+            gfx->setTextDatum(lgfx::textdatum_t::middle_right);
+            gfx->setTextColor(kGray);
+            gfx->drawString(value, right - 20, cy + 1);
+        }
+    }
+    // ページの点と補足
+    constexpr int kDotY = 400;
+    for (int i = 0; i < kSettingsPages; ++i) {
+        gfx->fillCircle(kCenterX + (i - 1) * 18, kDotY, 4, i == view.page % kSettingsPages ? TFT_WHITE : rgb565(0x48, 0x48, 0x4A));
+    }
+    gfx->loadFont(kFontHint);
+    gfx->setTextDatum(lgfx::textdatum_t::middle_center);
+    gfx->setTextColor(kGray);
+    gfx->drawString("B for more", kCenterX, 432);
+    gfx->unloadFont();
+    dirty->add(0, gfx->height() - 1);
+}
+
+// 設定画面で触れた行（なければ none）。指のずれを見込んで行の間のすき間も近い行に入れる。
+SettingItem setting_at(int page, int x, int y)
+{
+    if (x < kCenterX - kRowW / 2 - 10 || x > kCenterX + kRowW / 2 + 10) return SettingItem::none;
+    const int r = (y - kRowTop + kRowGap / 2) / (kRowH + kRowGap);
+    if (y < kRowTop - kRowGap / 2 || r < 0 || r >= kSettingsRows) return SettingItem::none;
+    return kSettingsLayout[page % kSettingsPages][r];
+}
+
 // タッチした位置と、触れている指の数を読む（CST820。0x02 = 指の数、0x03〜0x06 = X と Y の 12bit）。
 // 指を離した直後でも最後の位置が残っているので、指の数が 0 でも位置が 0 でなければ使う。
 bool read_touch(i2c_bus_handle_t bus, int* x, int* y, int* fingers)
@@ -1484,7 +1675,7 @@ void display_task(void*)
     std::tm utc     = {};
     data.time_valid = with_retry([&] { return job.rtc->read_time(&utc); }).ok();
     if (data.time_valid) data.epoch = epoch_from_utc(utc);
-    const std::int64_t epoch_at_ms = now_ms();
+    std::int64_t epoch_at_ms = now_ms();
     std::uint16_t mv               = 0;
     if (with_retry([&] { return job.power->read_battery_mv(&mv); }).ok() && mv > 0) {
         data.battery_mv      = mv;
@@ -1538,6 +1729,9 @@ void display_task(void*)
 #endif
         std::int64_t alarm_from_ms = now_ms();
         bool alarm_phase           = true;
+        bool alarm_phase_done      = false;  // 今の alarm_phase の振動と音を済ませた
+        SettingsView settings_view;
+        settings_view.battery_mv = data.battery_mv;
         auto draw_current          = [&](DirtyRows* d) {
             if (data.time_valid) frame.epoch = epoch_now();
             if (screen == Screen::clock) {
@@ -1547,6 +1741,11 @@ void display_task(void*)
             } else if (screen == Screen::qr) {
                 if (!face_state.drawn) {
                     draw_qr(gfx, d);
+                    face_state.drawn = true;
+                }
+            } else if (screen == Screen::settings) {
+                if (!face_state.drawn) {
+                    draw_settings(gfx, settings_view, d);
                     face_state.drawn = true;
                 }
             } else {
@@ -1560,7 +1759,7 @@ void display_task(void*)
         const std::int64_t t_draw1 = now_ms();
         const esp_err_t pushed = dirty.empty() ? ESP_OK : panel.push_rows(dirty.y0, dirty.y1);
         const std::int64_t t_push = now_ms();
-        (void)panel.set_brightness_percent(dock ? kDockBrightness : kBrightness);  // 時計を書いてから光らせる
+        (void)panel.set_brightness_percent(dock ? kDockBrightness : brightness_pct());  // 時計を書いてから光らせる
         s_lit_ms       = now_ms();
         s_lit_predrawn = predrawn;
         pm_apply(kCpuMhzIdle, false);
@@ -1602,14 +1801,15 @@ void display_task(void*)
         std::int64_t dock_total_ms = 0;
         std::int64_t next_check_ms = 0;
         std::int64_t next_bat_ms   = 0;
-        auto dock_ok = [&]() { return s_usb_power && data.time_valid && !is_night(epoch_now()); };
+        auto dock_ok = [&]() { return s_set.dock && s_usb_power && data.time_valid && !is_night(epoch_now()); };
         auto enter_dock = [&]() {
             dock          = true;
             dock_from_ms  = now_ms();
             next_check_ms = now_ms() + kDockCheckMs;
             next_bat_ms   = now_ms() + kDockBatteryMs;
-            if (screen == Screen::qr || (screen != Screen::clock && screen_for_show(epoch_now()) == Screen::clock)) {
-                screen       = Screen::clock;  // QR コードは暗くして出し続けない
+            if (screen == Screen::qr || screen == Screen::settings ||
+                (screen != Screen::clock && screen_for_show(epoch_now()) == Screen::clock)) {
+                screen       = Screen::clock;  // QR コードと設定は暗くして出し続けない
                 s_app.screen = static_cast<int>(screen);
             }
             frame.dock = true;
@@ -1622,7 +1822,7 @@ void display_task(void*)
             dock_total_ms += now_ms() - dock_from_ms;
             frame.dock = false;
             face_state = FaceState{};
-            (void)panel.set_brightness_percent(kBrightness);
+            (void)panel.set_brightness_percent(brightness_pct());
         };
         if (dock) {
             dock          = false;
@@ -1636,15 +1836,92 @@ void display_task(void*)
             job.interacted       = true;
             s_app.last_use_epoch = epoch_now();
         };
-        std::int64_t qr_until_us = screen == Screen::qr ? esp_timer_get_time() + kQrShowUs : 0;
+        std::int64_t qr_until_us = screen == Screen::qr ? esp_timer_get_time() + kQrShowUs
+                                 : screen == Screen::settings ? esp_timer_get_time() + kSettingsShowUs
+                                                              : 0;
         auto go_screen = [&](Screen next) {
             screen       = next;
             s_app.screen = static_cast<int>(next);
             face_state   = FaceState{};  // 全体を描き直す
             if (next == Screen::qr) qr_until_us = esp_timer_get_time() + kQrShowUs;
+            if (next == Screen::settings) {
+                qr_until_us                = esp_timer_get_time() + kSettingsShowUs;
+                settings_view.page        = 0;
+                settings_view.confirm_off = false;
+                settings_view.sync        = SyncState::idle;
+            }
+        };
+        bool power_off = false;
+        std::int64_t confirm_until_ms = 0;
+        auto redraw_settings = [&]() {
+            face_state  = FaceState{};
+            qr_until_us = esp_timer_get_time() + kSettingsShowUs;
+            DirtyRows d;
+            draw_current(&d);
+            if (!d.empty()) (void)panel.push_rows(d.y0, d.y1);
+        };
+        // 設定の行をタップしたとき
+        auto settings_tap = [&](SettingItem item) {
+            if (item != SettingItem::power_off) settings_view.confirm_off = false;
+            switch (item) {
+                case SettingItem::dock: s_set.dock = !s_set.dock; break;
+                case SettingItem::raise: s_set.raise = !s_set.raise; break;
+                case SettingItem::night: s_set.night = !s_set.night; break;
+                case SettingItem::brightness:
+                    s_set.brightness = (s_set.brightness + 1) % 3;
+                    (void)panel.set_brightness_percent(brightness_pct());
+                    break;
+                case SettingItem::vibration:
+                    s_set.vibration = !s_set.vibration;
+                    buzz(job.bus, 60);  // オンにしたら確かめに振動する
+                    break;
+                case SettingItem::sound:
+                    s_set.sound = (s_set.sound + 1) % 4;
+                    play_sound(job.bus, watch::Sound::beep);  // この音量で鳴らしてみる
+                    break;
+                case SettingItem::sync: {
+                    if (settings_view.sync == SyncState::running) break;
+                    settings_view.sync = SyncState::running;
+                    redraw_settings();
+                    const esp_err_t r = maybe_wifi_time_sync(job.rtc, true);
+                    pm_apply(kCpuMhzIdle, false);  // 時刻合わせが浅い眠りを許すので、画面が点いている間は戻す
+                    settings_view.sync = r == ESP_OK                  ? SyncState::done
+                                         : r == ESP_ERR_NOT_SUPPORTED ? SyncState::no_wifi
+                                                                      : SyncState::failed;
+                    std::tm utc = {};
+                    if (job.rtc->read_time(&utc).ok()) {
+                        data.time_valid = true;
+                        data.epoch      = epoch_from_utc(utc);
+                        epoch_at_ms     = now_ms();
+                    }
+                    break;
+                }
+                case SettingItem::battery: {
+                    std::uint16_t mv = 0;
+                    if (job.power->read_battery_mv(&mv).ok() && mv > 0) settings_view.battery_mv = mv;
+                    break;
+                }
+                case SettingItem::power_off:
+                    if (settings_view.confirm_off) {
+                        power_off = true;
+                    } else {
+                        settings_view.confirm_off = true;
+                        confirm_until_ms          = now_ms() + 3000;
+                    }
+                    break;
+                default: return;
+            }
+            if (item != SettingItem::sync && item != SettingItem::battery && item != SettingItem::power_off &&
+                item != SettingItem::version) {
+                s_settings_dirty = true;
+            }
+            ESP_LOGI(kTag, "SETTING item=%d dock=%d raise=%d night=%d bright=%u vib=%d sound=%u", static_cast<int>(item),
+                     s_set.dock, s_set.raise, s_set.night, brightness_pct(), s_set.vibration, s_set.sound);
+            if (!power_off) redraw_settings();
         };
         auto stop_alarm = [&]() {
-            s_app.tm_alarm = false;
+            s_app.tm_alarm   = false;
+            alarm_phase_done = false;
             face_state     = FaceState{};
             if (vibrating) {
                 (void)watch::set_vibration(job.bus, false);
@@ -1655,14 +1932,23 @@ void display_task(void*)
             leave_dock();
             timer_start_alarm();
             go_screen(Screen::timer);
-            alarm_from_ms = now_ms();
+            alarm_from_ms    = now_ms();
+            alarm_phase_done = false;
             deadline_us   = std::max(deadline_us, esp_timer_get_time() + kAlarmUs);
             job.interacted = true;
             ESP_LOGI(kTag, "TIMER_ALARM");
         };
         if (s_app.tm_alarm) ESP_LOGI(kTag, "TIMER_ALARM (on wake)");
         while (true) {
-            if (screen == Screen::qr) deadline_us = std::max(deadline_us, qr_until_us);
+            if (screen == Screen::qr || screen == Screen::settings) deadline_us = std::max(deadline_us, qr_until_us);
+            if (power_off) {
+                reason = "power_off";
+                break;
+            }
+            if (settings_view.confirm_off && now_ms() >= confirm_until_ms && screen == Screen::settings) {
+                settings_view.confirm_off = false;
+                redraw_settings();
+            }
             if (!dock) {
                 const bool lowered = job.stop && !job.interacted && !s_app.tm_alarm;
                 if (lowered || esp_timer_get_time() >= deadline_us) {
@@ -1699,11 +1985,16 @@ void display_task(void*)
             }
             if (s_app.tm_running && timer_left_us(epoch_now()) == 0) start_alarm();
             if (s_app.tm_alarm) {
-                // 0.4 秒ごとに振動と色を切り替える
-                alarm_phase = ((now_ms() - alarm_from_ms) / 400) % 2 == 0;
-                if (alarm_phase != vibrating) {
-                    (void)watch::set_vibration(job.bus, alarm_phase);
-                    vibrating = alarm_phase;
+                // 0.4 秒ごとに振動と色を切り替える（振動・音は設定しだい）
+                const bool phase = ((now_ms() - alarm_from_ms) / 400) % 2 == 0;
+                if (phase != alarm_phase || !alarm_phase_done) {
+                    alarm_phase      = phase;
+                    alarm_phase_done = true;
+                    if (s_set.vibration && alarm_phase != vibrating) {
+                        (void)watch::set_vibration(job.bus, alarm_phase);
+                        vibrating = alarm_phase;
+                    }
+                    if (alarm_phase) play_sound(job.bus, watch::Sound::beep);
                 }
             }
             {
@@ -1750,12 +2041,19 @@ void display_task(void*)
                                  fingers, static_cast<int>(screen));
                     } else if (s_app.tm_alarm) {
                         stop_alarm();
+                    } else if (screen == Screen::settings) {
+                        int x = -1, y = -1, fingers = 0;
+                        const bool got          = read_touch(job.bus, &x, &y, &fingers);
+                        const SettingItem item  = got ? setting_at(settings_view.page, x, y) : SettingItem::none;
+                        ESP_LOGI(kTag, "TOUCH settings x=%d y=%d got=%d item=%d", x, y, got, static_cast<int>(item));
+                        settings_tap(item);
+                        next_tap_ms = now_ms() + 300;
                     } else if (screen == Screen::clock) {
 #if WATCH_HAS_CHARACTER
                         s_character_index = character_any(s_character_index);
                         jump_from_ms      = now_ms();
                         char_offset       = INT32_MIN;  // 描き直す
-                        if (kTapSound) watch::audio_play(job.bus, watch::Sound::tap);
+                        play_sound(job.bus, watch::Sound::tap);
 #endif
                     }
                 }
@@ -1771,9 +2069,7 @@ void display_task(void*)
                     } else if (screen == Screen::timer) {
                         timer_reset();
                     }
-                    (void)watch::set_vibration(job.bus, true);  // リセットしたことを短い振動で知らせる
-                    vTaskDelay(pdMS_TO_TICKS(40));
-                    (void)watch::set_vibration(job.bus, false);
+                    buzz(job.bus, 40);  // リセットしたことを短い振動で知らせる
                     ESP_LOGI(kTag, "TOUCH hold reset screen=%d", static_cast<int>(screen));
                 }
                 if (!still) {
@@ -1834,12 +2130,16 @@ void display_task(void*)
                     stopwatch_toggle(epoch_now());
                 } else if (screen == Screen::timer) {
                     timer_toggle(epoch_now());
+                } else if (screen == Screen::settings) {
+                    settings_view.page        = (settings_view.page + 1) % kSettingsPages;
+                    settings_view.confirm_off = false;
+                    redraw_settings();
                 } else {
 #if WATCH_HAS_CHARACTER
                     s_character_index = character_any(s_character_index);
                     jump_from_ms      = now_ms();
                     char_offset       = INT32_MIN;
-                    if (kTapSound) watch::audio_play(job.bus, watch::Sound::tap);
+                    play_sound(job.bus, watch::Sound::tap);
 #endif
                 }
             }
@@ -1848,6 +2148,7 @@ void display_task(void*)
             vTaskDelay(pdMS_TO_TICKS(kFrameMs));
         }
         if (vibrating) (void)watch::set_vibration(job.bus, false);
+        if (power_off) s_power_off_request = true;
         watch::audio_shutdown();
         if (s_app.tm_alarm) s_app.tm_alarm = false;  // 鳴り終わった
         if (dock) dock_total_ms += now_ms() - dock_from_ms;
@@ -1995,6 +2296,7 @@ extern "C" void app_main(void)
     }
     mark("pm1");
 
+    if (s_set.magic != kSettingsMagic) settings_load();
     static ImuFifo fifo(bus);
     g_job.bus     = bus;
     g_job.rtc     = &rtc;
@@ -2008,6 +2310,7 @@ extern "C" void app_main(void)
         s_false_awake_ms = s_shown_ms = 0;
         s_next_record_epoch         = 0;
         s_app                       = AppState{};  // 書き込み直後などは RTC メモリに前の値が残っていることがある
+        settings_load();
         ESP_LOGI(kTag, "COLD_BOOT cause=%d reset_reason=%d", static_cast<int>(cause), static_cast<int>(esp_reset_reason()));
         {
             const esp_err_t mux = watch::hold_usb_mux(bus);
@@ -2079,12 +2382,23 @@ extern "C" void app_main(void)
     }
 
     // 充電中で画面を出さなかった起床（空振り・1 時間ごとの見回り）でも、夜でなければ常時表示に入る。
-    if (s_usb_power && !g_shown && !cold_boot) {
+    if (s_set.dock && s_usb_power && !g_shown && !cold_boot) {
         std::tm utc = {};
         if (with_retry([&] { return rtc.read_time(&utc); }).ok() && !is_night(epoch_from_utc(utc))) {
             ESP_LOGI(kTag, "DOCK start (usb)");
             show_watch(&fifo, ShowMode::dock);
         }
+    }
+    if (s_settings_dirty) settings_save();
+    if (s_power_off_request) {
+        s_power_off_request = false;
+        ESP_LOGI(kTag, "POWER_OFF requested (usb=%d)", s_usb_power);
+        vTaskDelay(kLogFlushWait);
+        wait_pm1_awake(bus);
+        const auto off = power.power_off_keep_charging();
+        // 普通は戻ってこない。USB が挿さっていると切れないことがあるので、そのときは普段どおり寝る。
+        vTaskDelay(pdMS_TO_TICKS(500));
+        ESP_LOGW(kTag, "POWER_OFF returned error=%s raw=%d", esp_err_to_name(off.error), static_cast<int>(off.raw_error));
     }
     mark("decided");
     wait_pm1_awake(bus);  // 判定や表示の間に PM1 が I2C の眠りに入っている（50ms のやり直し待ちを避ける）
@@ -2168,8 +2482,11 @@ extern "C" void app_main(void)
         sleep_us                = std::min(sleep_us, std::max<std::int64_t>(1000, left));
         ESP_LOGI(kTag, "TIMER running, wake in %lldms", sleep_us / 1000);
     }
-    if (night) sleep_us = std::min(sleep_us, std::max<std::int64_t>(1000000, until_morning_s * 1000000 + 5000000));
-    power_result = power.enter_l2_quick(night ? m5sw::power::WakeSelection::none : m5sw::power::WakeSelection::rtc_imu, static_cast<std::uint64_t>(sleep_us),
+    // 設定: 「腕を上げて点ける」がオフなら腕の動きで起きない。「夜モード」がオフなら夜も腕の動きで起きる。
+    night            = night && s_set.night;
+    const bool wrist = s_set.raise && !night;
+    if (night && s_set.raise) sleep_us = std::min(sleep_us, std::max<std::int64_t>(1000000, until_morning_s * 1000000 + 5000000));
+    power_result = power.enter_l2_quick(wrist ? m5sw::power::WakeSelection::rtc_imu : m5sw::power::WakeSelection::none, static_cast<std::uint64_t>(sleep_us),
                                         m5sw::power::L2Pm1IdleSleep::enabled, kKeyWakeMask);
     fail("l2_returned", power_result.error, power_result.raw_error);
 }
