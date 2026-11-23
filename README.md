@@ -17,6 +17,8 @@
 - 充電スタンドに立てている間は、暗めの置き時計になります。
 - 1 時間ごとに電池の電圧、復帰した回数、点灯した時間を記録し、何に電力を使ったかを後から調べられます（`apps/watch/tools/battery_report.py`）。
 
+![手首を上げると点灯する](docs/images/wrist_raise.gif)
+
 ![画面（左から時計、ストップウォッチ、タイマー、設定）](docs/images/screens.jpg)
 
 電池（450mAh）は、作者の普段の使い方で約 2 日もちます。
@@ -27,6 +29,7 @@
 
 <p>
   <img src="3d-print/images/band_adapter.jpg" alt="本体の裏側に付けたバンドアダプタ" height="360">
+  <img src="3d-print/images/watch_band.jpg" alt="22mm の時計バンドを付けたところ" height="360">
   <img src="3d-print/images/stand.jpg" alt="スタンドに立てたところ" height="360">
 </p>
 

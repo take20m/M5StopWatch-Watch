@@ -20,7 +20,10 @@
 
 ### バンドアダプタ
 
-![本体の裏側に付けたバンドアダプタ](images/band_adapter.jpg)
+<p>
+  <img src="images/band_adapter.jpg" alt="本体の裏側に付けたバンドアダプタ" height="360">
+  <img src="images/watch_band.jpg" alt="22mm の時計バンドを付けたところ" height="360">
+</p>
 
 - 本体背面の 2 本のネジ（M2 × 8）を外し、アダプタの板（2mm）をはさんで **M2 × 12 の皿ネジ** で留めます。
 - バネ棒は本体の縁の下に来るので、画面側から見るとラグがほとんどはみ出しません。
