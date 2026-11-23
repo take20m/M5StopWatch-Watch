@@ -50,7 +50,7 @@ USB-C ケーブルのプラグを塔の中に固定し、本体を上から差�
 
 - Grove キャップ：最初の版はきつくて入りませんでした。つぶしリブの量を変えて合わせています。
 - USB-C キャップ：TPU か PETG を想定しています。
-- どちらもまだ実機で合わせ終わっていません。
+- どちらもまだ実機での調整が終わっていません。
 
 ## STL の書き出し
 
@@ -67,12 +67,12 @@ cd tools && npm install
 node render2.mjs ../stand/stopwatch_split_stand.scad stand.stl 'part="stand"'
 ```
 
-`tools/check_assembly.py`（Python + trimesh）で、組み立てたときに部品どうしやプラグが重ならないかを調べられます。
+`tools/check_assembly.py`（Python + trimesh）で、組み立てたときに部品どうしやプラグが干渉しないかを調べられます。
 
 ## 寸法の出典
 
 本体の形は M5Stack 公式の構造データ（[M5_Hardware](https://github.com/m5stack/M5_Hardware) の `StopWatch.stl`、MIT）から読み取り、
-合わないところは実測で直しました。このリポジトリには公式のデータそのものは入っていません。
+寸法が合わないところは実測して直しました。このリポジトリには公式のデータそのものは入っていません。
 
 - 本体：直径 52 / 厚さ 15.5、USB-C は 6 時の側面
 - 背面のネジ：M2、X = ±20（3 時・9 時の方向）
