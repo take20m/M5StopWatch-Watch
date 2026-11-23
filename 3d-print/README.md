@@ -2,6 +2,7 @@
 
 [M5Stack StopWatch](https://docs.m5stack.com/en/core/StopWatch) を腕時計・卓上時計として使うための 3D プリント部品です。
 どれも OpenSCAD で設計していて、`.scad`（元データ）と `.stl`（そのまま刷れるデータ）を置いています。
+同じデータを [MakerWorld](https://makerworld.com/ja/models/3669697-m5stack-stopwatch-band-adapter-charging-stand) でも公開しています（CC BY 4.0）。
 
 ![部品一覧](images/parts.jpg)
 

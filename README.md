@@ -23,7 +23,7 @@
 
 ## 3D プリント部品
 
-バンドアダプタと充電スタンドは 3D プリンタで作りました。データ（`.scad` と `.stl`）は [`3d-print/`](3d-print/) にあり、刷る向きと組み立て方は [3d-print/README.md](3d-print/README.md) にまとめています。
+バンドアダプタと充電スタンドは 3D プリンタで作りました。データ（`.scad` と `.stl`）は [`3d-print/`](3d-print/) にあり、刷る向きと組み立て方は [3d-print/README.md](3d-print/README.md) にまとめています。同じデータを [MakerWorld](https://makerworld.com/ja/models/3669697-m5stack-stopwatch-band-adapter-charging-stand) でも公開しています。
 
 <p>
   <img src="3d-print/images/band_adapter.jpg" alt="本体の裏側に付けたバンドアダプタ" height="360">
