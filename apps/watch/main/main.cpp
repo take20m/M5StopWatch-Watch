@@ -1596,7 +1596,7 @@ void draw_settings(lgfx::LovyanGFX* gfx, const SettingsView& view, DirtyRows* di
     gfx->loadFont(kFontHint);
     gfx->setTextDatum(lgfx::textdatum_t::middle_center);
     gfx->setTextColor(kGray);
-    gfx->drawString("Swipe up for more", kCenterX, 432);
+    gfx->drawString("Swipe for more", kCenterX, 432);
     gfx->unloadFont();
     dirty->add(0, gfx->height() - 1);
 }
@@ -2096,8 +2096,21 @@ void display_task(void*)
                     if (touch_long_done || s_app.tm_alarm) {
                         // 長押しで済んだ
                     } else if (horizontal) {
-                        const int step = dx < 0 ? 1 : kScreenCount - 1;
-                        go_screen(static_cast<Screen>((static_cast<int>(screen) + step) % kScreenCount));
+                        // 設定画面ではページを先にめくり、端のページから先は隣の画面へ（ページが横に並んでいる見立て）
+                        const bool forward = dx < 0;
+                        if (screen == Screen::settings && forward && settings_view.page < kSettingsPages - 1) {
+                            ++settings_view.page;
+                            settings_view.confirm_off = false;
+                            redraw_settings();
+                        } else if (screen == Screen::settings && !forward && settings_view.page > 0) {
+                            --settings_view.page;
+                            settings_view.confirm_off = false;
+                            redraw_settings();
+                        } else {
+                            const int step = forward ? 1 : kScreenCount - 1;
+                            go_screen(static_cast<Screen>((static_cast<int>(screen) + step) % kScreenCount));
+                            if (screen == Screen::settings && !forward) settings_view.page = kSettingsPages - 1;  // 右から戻ってきた
+                        }
                     } else if (vertical) {
                         if (screen == Screen::settings) {
                             const int step            = dy < 0 ? 1 : kSettingsPages - 1;
