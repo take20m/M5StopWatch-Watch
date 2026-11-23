@@ -1,6 +1,6 @@
 # M5StopWatch Watch
 
-M5Stack StopWatch を Apple Watch の代わりに毎日着ける腕時計にするプロジェクトです。
+M5Stack StopWatch を毎日着ける腕時計にするプロジェクトです。
 ファームウェア（ESP-IDF）と、バンドアダプタ・充電スタンドの 3D プリントデータが入っています。
 
 *Firmware and 3D-printable parts that turn the M5Stack StopWatch into an everyday wristwatch. Based on [M5StopWatch-PowerDemo](https://github.com/m5stack/M5StopWatch-PowerDemo) (MIT).*
