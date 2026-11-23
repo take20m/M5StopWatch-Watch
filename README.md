@@ -1,3 +1,75 @@
+# M5StopWatch Watch
+
+M5Stack StopWatch を Apple Watch の代わりに毎日着ける腕時計にするプロジェクトです。
+ファームウェア（ESP-IDF）と、バンドアダプタ・充電スタンドの 3D プリントデータが入っています。
+
+*Firmware and 3D-printable parts that turn the M5Stack StopWatch into an everyday wristwatch. Based on [M5StopWatch-PowerDemo](https://github.com/m5stack/M5StopWatch-PowerDemo) (MIT).*
+
+![手首に着けた StopWatch](docs/images/watch_wrist.jpg)
+
+## できること
+
+- 手首を上げると点きます。BMI270 の動き検出で起き、起きる前の動き（FIFO）と姿勢から「時計を見たか」を判定します。動かしてから表示まで約 0.7 秒で、腕を下ろすと消えます。
+- ボタン（KEYA / KEYB）や画面のタップでも点きます。
+- 画面：時計、ストップウォッチ、タイマー（振動と音で知らせる）、QR コード、設定。左右のスライドかボタンで切り替えます。
+- 設定画面：手首で点けるか、着ける手（右／左）、夜は手首で点けない（1〜6 時）、充電中の常時表示、明るさ、振動、音量、今すぐ時刻合わせ、電源を切る。
+- 時刻は Wi-Fi（NTP）で 1 日 1 回合わせます。
+- 充電スタンドに立てている間は、暗めの置き時計になります。
+- 1 時間ごとに電池の電圧と起きた回数・点けた時間を記録し、何に電気を使ったかを後から調べられます（`apps/watch/tools/battery_report.py`）。
+
+![画面](docs/images/screens.jpg)
+
+電池（450mAh）は普段使いで平均 13〜18mA 前後を使い（実測）、1 日強もちます。目標の 2 日にはまだ届いていません。
+
+## フォルダの構成
+
+```text
+apps/watch/   腕時計のファームウェア
+3d-print/     バンドアダプタ・充電スタンド・端子キャップの 3D プリントデータ（→ 3d-print/README.md）
+modules/      ボード用の共通モジュール（PowerDemo から。手首上げ・画面の電源などを追加）
+tests/        PowerDemo の測定用ファーム ＋ 手首上げの実験用ファーム（imu_orient_diag、look_wake_l2、wrist_wake_l2）
+```
+
+## 書き込み方
+
+1. ESP-IDF 5.5 を入れて有効にします（[公式の手順](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/get-started/index.html)）。
+2. リポジトリを取得します。
+
+   ```sh
+   git clone -b watch-app --recursive https://github.com/take20m/M5StopWatch-Watch.git
+   cd M5StopWatch-Watch/apps/watch
+   ```
+
+3. Wi-Fi の時刻合わせを使うなら、`main/wifi_secrets.example.h` を `main/wifi_secrets.h` にコピーして、SSID とパスワードを書きます。
+   QR コードの画面を使うなら、`main/watch_profile.example.h` を `main/watch_profile.h` にコピーして URL を書きます。
+   どちらも git には入りません。ファイルがなければ、その機能は使いません。
+4. ビルドして書き込みます。
+
+   ```sh
+   idf.py set-target esp32s3
+   idf.py build
+   idf.py -p /dev/cu.usbmodem* flash
+   ```
+
+- 寝ている間は USB が切れます。書き込めないときは、手首を動かして起こすか、電源ボタンを長押しして緑の LED が点滅したら離し、ダウンロードモードにします。ダウンロードモードから抜けるには電源ボタンを 1 回押します。
+- `apps/watch/tools/flash_capture.sh <ログのファイル>` を実行すると、書き込んだあとログを記録し続けます。寝て USB が切れても待ち直します。
+- 工場出荷時のファームウェアに戻したいときのために、最初に `esptool.py read_flash 0 0x1000000 backup.bin` で控えを取っておくことをおすすめします。
+- 時計の文字盤に好きなキャラクターの画像や声を入れる仕組み（`apps/watch/tools/make_character.py`、`make_voices.py`）があります。画像や声は著作物なので、このリポジトリには入れていません。
+
+## 注意
+
+- 基板 v1.0 は背面ラベルの「BAT」ピンが実は 5V 入力です（v1.0.1 で修正）。外付けの部品をつなぐ前に確認してください。
+- 手首上げの判定は作者の手首（右手）と使い方に合わせて調整しています。しきい値は `apps/watch/main/main.cpp` の先頭にあります。
+
+## ライセンス
+
+[MIT License](LICENSE) です。元の PowerDemo（© M5Stack）と同じで、3D プリントデータも MIT です。
+使っているライブラリとフォントのライセンスは [Third-Party Notices](THIRD_PARTY_NOTICES.md) と `apps/watch/main/fonts/OFL_*.txt` を見てください。
+
+---
+
+以下は、元の M5StopWatch Power Demo の説明です。
+
 # M5StopWatch Power Demo
 
 [English](README.md) | [简体中文](README_CN.md)

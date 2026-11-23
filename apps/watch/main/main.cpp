@@ -895,14 +895,35 @@ CharacterSet character_set()
 // ---------------------------------------------------------------------------
 // ストップウォッチとタイマー（寝ている間も進む。状態は RTC メモリに置く）
 // ボタン: KEYA（GPIO2）= 次の画面、KEYB（GPIO1）= スタート／ストップ、KEYB 長押し = リセット。
-// タイマーの画面でタップすると時間を変える。KEYA で最後に来る QR コードの画面は、ポートフォリオの URL を出す。
+// タイマーの画面でタップすると時間を変える。設定画面の手前の QR コードの画面は、watch_profile.h に書いた URL を出す
+// （見本は watch_profile.example.h。ファイルがなければ QR コードの画面は飛ばす）。
 // ---------------------------------------------------------------------------
+#if __has_include("watch_profile.h")
+#include "watch_profile.h"
+#endif
+#ifndef WATCH_QR_URL
+#define WATCH_QR_URL ""
+#endif
+#ifndef WATCH_QR_LABEL
+#define WATCH_QR_LABEL ""
+#endif
 enum class Screen : int { clock = 0, stopwatch = 1, timer = 2, qr = 3, settings = 4 };
 constexpr int kScreenCount             = 5;
 constexpr std::int64_t kSettingsShowUs = 20000000;  // 設定画面は最後に触ってから 20 秒出す
 constexpr std::int64_t kQrShowUs       = 30000000;  // QR コードはスマホで読む時間がいるので 30 秒出す
-constexpr const char* kQrUrl           = "https://take20m.dev/";
-constexpr const char* kQrLabel         = "take20m.dev";
+constexpr const char* kQrUrl           = WATCH_QR_URL;
+constexpr const char* kQrLabel         = WATCH_QR_LABEL;
+constexpr bool kHasQr                  = sizeof(WATCH_QR_URL) > 1;
+
+// dir（+1 = 次、-1 = 前）の画面。QR コードの URL がなければその画面を飛ばす。
+Screen step_screen(Screen screen, int dir)
+{
+    int i = static_cast<int>(screen);
+    do {
+        i = (i + dir + kScreenCount) % kScreenCount;
+    } while (!kHasQr && i == static_cast<int>(Screen::qr));
+    return static_cast<Screen>(i);
+}
 constexpr int kTimerPresetsS[]         = {60, 180, 300, 600, 900, 1800, 3600};
 constexpr int kTimerPresetCount        = sizeof(kTimerPresetsS) / sizeof(kTimerPresetsS[0]);
 constexpr std::int64_t kAppIdleBackS   = 120;       // 止まっているアプリは 2 分さわらなければ時計に戻す
@@ -1081,6 +1102,7 @@ Screen screen_for_show(std::int64_t epoch)
 {
     if (s_app.tm_alarm) return Screen::timer;
     Screen screen = static_cast<Screen>(s_app.screen % kScreenCount);
+    if (!kHasQr && screen == Screen::qr) screen = Screen::clock;
     const bool running = (screen == Screen::stopwatch && s_app.sw_running) || (screen == Screen::timer && s_app.tm_running);
     if (screen != Screen::clock && !running && epoch != kNoEpoch && epoch - s_app.last_use_epoch > kAppIdleBackS) {
         screen = Screen::clock;
@@ -2122,8 +2144,7 @@ void display_task(void*)
                             settings_view.confirm_off = false;
                             redraw_settings();
                         } else {
-                            const int step = forward ? 1 : kScreenCount - 1;
-                            go_screen(static_cast<Screen>((static_cast<int>(screen) + step) % kScreenCount));
+                            go_screen(step_screen(screen, forward ? 1 : -1));
                             if (screen == Screen::settings && !forward) settings_view.page = kSettingsPages - 1;  // 右から戻ってきた
                         }
                     } else if (vertical) {
@@ -2138,7 +2159,7 @@ void display_task(void*)
                     } else if (app_screen) {
                         const int pill = pill_at(touch_x, touch_y);
                         if (pill == 1) {
-                            go_screen(static_cast<Screen>((static_cast<int>(screen) + 1) % kScreenCount));
+                            go_screen(step_screen(screen, 1));
                         } else if (pill == 2) {
                             if (screen == Screen::stopwatch) {
                                 stopwatch_toggle(epoch_now());
@@ -2172,7 +2193,7 @@ void display_task(void*)
                 if (s_app.tm_alarm) {
                     stop_alarm();
                 } else {
-                    go_screen(static_cast<Screen>((static_cast<int>(screen) + 1) % kScreenCount));
+                    go_screen(step_screen(screen, 1));
                 }
             }
             if (!a) a_ignore = false;

@@ -67,4 +67,6 @@ obj/
 
 # apps/watch: Wi-Fi の SSID とパスワード（ユーザーが手元で作る）
 apps/watch/main/wifi_secrets.h
+# apps/watch: QR コードの画面に出す自分の URL（ユーザーが手元で作る）
+apps/watch/main/watch_profile.h
 apps/watch/main/assets/

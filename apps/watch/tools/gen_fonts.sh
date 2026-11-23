@@ -12,4 +12,4 @@ $PY fonts/make_vlw.py watch_fonts.h \
   "kFontHint:$T:500:20:${L}0123456789/:+-. ·" \
   "kFontPill:$T:600:24:$L 0123456789%-.:/…" \
   "kFontBatteryPct:$T:600:26:0123456789%" \
-  "kFontQrUrl:$T:600:30:take20m.dv"
+  "kFontQrUrl:$T:600:30:${L}0123456789.-_/@~"   # watch_profile.h の WATCH_QR_LABEL に使える文字

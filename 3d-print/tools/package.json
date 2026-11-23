@@ -1,0 +1,10 @@
+{
+  "name": "m5stopwatch-3d-print-tools",
+  "version": "1.0.0",
+  "description": "OpenSCAD の wasm 版で .scad から STL を書き出すための道具",
+  "license": "MIT",
+  "dependencies": {
+    "openscad-wasm-prebuilt": "^1.2.0"
+  },
+  "private": true
+}
