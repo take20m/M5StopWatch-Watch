@@ -570,8 +570,14 @@ void hist_reset()
     s_hist_count = 0;
 }
 
+bool left_wrist();  // 設定（下で定義）
+
+// 左手につけたときは y（腕に沿った向き）の符号を反転して、右手の向きにそろえる。
+// 文字盤を正しい向きで見るなら、左手の姿勢は右手の鏡写しで、腕に沿った軸だけが逆になる。
+// 判定のしきい値は右手で合わせたもの（2026-11-15 動画）なので、それをそのまま使う。
 void hist_push(std::int16_t x, std::int16_t y, std::int16_t z)
 {
+    if (left_wrist()) y = (y == INT16_MIN) ? INT16_MAX : static_cast<std::int16_t>(-y);
     s_hist[s_hist_head][0] = x;
     s_hist[s_hist_head][1] = y;
     s_hist[s_hist_head][2] = z;
@@ -935,6 +941,7 @@ struct Settings {
     std::uint8_t brightness = 1;      // kBrightnessOptions の番号（40%）
     bool vibration          = true;   // タイマーの知らせ・長押しリセットで振動する
     std::uint8_t sound      = 0;      // 0 = 音なし、1〜3 = 小・中・大
+    bool left               = false;  // 左手につける（手首の判定の向きを変える）。後から足したので末尾に置く
 };
 RTC_DATA_ATTR Settings s_set;
 bool s_settings_dirty    = false;  // この起床で変えた（寝る前に NVS に書く）
@@ -943,6 +950,7 @@ constexpr std::uint8_t kVolumeRegs[] = {0, 0xA8, 0xB4, 0xBF};  // ES8311 の音�
 constexpr const char* kSoundNames[]  = {"Off", "Low", "Medium", "High"};
 
 std::uint8_t brightness_pct() { return kBrightnessOptions[s_set.brightness % 3]; }
+bool left_wrist() { return s_set.left; }
 
 // 設定どおりに音を鳴らす（音なしなら鳴らさない）。
 void play_sound(i2c_bus_handle_t bus, watch::Sound sound)
@@ -968,14 +976,15 @@ void settings_load()
     nvs_handle_t h;
     if (nvs_open_ns("settings", &h, NVS_READONLY)) {
         size_t size = sizeof(loaded);
-        if (nvs_get_blob(h, "v1", &loaded, &size) != ESP_OK || size != sizeof(loaded) || loaded.magic != kSettingsMagic) {
+        // 古い版で保存したもの（後から足した項目がなく短い）も読み、足りない項目は既定のままにする
+        if (nvs_get_blob(h, "v1", &loaded, &size) != ESP_OK || size < 7 || loaded.magic != kSettingsMagic) {
             loaded = Settings{};
         }
         nvs_close(h);
     }
     s_set = loaded;
-    ESP_LOGI(kTag, "SETTINGS dock=%d raise=%d night=%d bright=%u vib=%d sound=%u", s_set.dock, s_set.raise, s_set.night,
-             brightness_pct(), s_set.vibration, s_set.sound);
+    ESP_LOGI(kTag, "SETTINGS dock=%d raise=%d night=%d bright=%u vib=%d sound=%u left=%d", s_set.dock, s_set.raise,
+             s_set.night, brightness_pct(), s_set.vibration, s_set.sound, s_set.left);
 }
 
 void settings_save()
@@ -986,8 +995,8 @@ void settings_save()
     if (err == ESP_OK) nvs_commit(h);
     nvs_close(h);
     s_settings_dirty = false;
-    ESP_LOGI(kTag, "SETTINGS saved dock=%d raise=%d night=%d bright=%u vib=%d sound=%u err=%s", s_set.dock, s_set.raise,
-             s_set.night, brightness_pct(), s_set.vibration, s_set.sound, esp_err_to_name(err));
+    ESP_LOGI(kTag, "SETTINGS saved dock=%d raise=%d night=%d bright=%u vib=%d sound=%u left=%d err=%s", s_set.dock,
+             s_set.raise, s_set.night, brightness_pct(), s_set.vibration, s_set.sound, s_set.left, esp_err_to_name(err));
 }
 
 // 寝ている間も進む ESP32 の RTC タイマー（内蔵の発振器なので少しずれる）。
@@ -1495,12 +1504,12 @@ void draw_qr(lgfx::LovyanGFX* gfx, DirtyRows* dirty)
 // 設定画面。iPhone の設定アプリ風に、濃い灰色の角丸の行を縦に並べる（丸い画面に収まるよう 1 ページ 4 行まで）。
 // 行をタップすると切り替わる。B ボタンで次のページ。
 // ---------------------------------------------------------------------------
-enum class SettingItem { dock, raise, night, brightness, vibration, sound, sync, version, battery, power_off, none };
+enum class SettingItem { dock, raise, night, brightness, vibration, sound, sync, version, battery, power_off, wrist, none };
 constexpr int kSettingsPages                        = 3;
 constexpr int kSettingsRows                         = 4;
 constexpr SettingItem kSettingsLayout[kSettingsPages][kSettingsRows] = {
-    {SettingItem::dock, SettingItem::raise, SettingItem::night, SettingItem::brightness},
-    {SettingItem::vibration, SettingItem::sound, SettingItem::sync, SettingItem::none},
+    {SettingItem::raise, SettingItem::wrist, SettingItem::night, SettingItem::dock},
+    {SettingItem::brightness, SettingItem::vibration, SettingItem::sound, SettingItem::sync},
     {SettingItem::version, SettingItem::battery, SettingItem::power_off, SettingItem::none},
 };
 constexpr int kRowW = 340, kRowH = 60, kRowGap = 8, kRowTop = 112;
@@ -1558,6 +1567,7 @@ void draw_settings(lgfx::LovyanGFX* gfx, const SettingsView& view, DirtyRows* di
                 label = "Brightness";
                 std::snprintf(value, sizeof(value), "%u%%", brightness_pct());
                 break;
+            case SettingItem::wrist: label = "Wrist"; std::snprintf(value, sizeof(value), "%s", s_set.left ? "Left" : "Right"); break;
             case SettingItem::vibration: label = "Vibration"; toggle = s_set.vibration; break;
             case SettingItem::sound: label = "Sound"; std::snprintf(value, sizeof(value), "%s", kSoundNames[s_set.sound % 4]); break;
             case SettingItem::sync: {
@@ -1876,6 +1886,10 @@ void display_task(void*)
                 case SettingItem::dock: s_set.dock = !s_set.dock; break;
                 case SettingItem::raise: s_set.raise = !s_set.raise; break;
                 case SettingItem::night: s_set.night = !s_set.night; break;
+                case SettingItem::wrist:
+                    s_set.left = !s_set.left;
+                    hist_reset();  // 前の向きでためた履歴は使わない
+                    break;
                 case SettingItem::brightness:
                     s_set.brightness = (s_set.brightness + 1) % 3;
                     (void)panel.set_brightness_percent(brightness_pct());
@@ -1924,8 +1938,9 @@ void display_task(void*)
                 item != SettingItem::version) {
                 s_settings_dirty = true;
             }
-            ESP_LOGI(kTag, "SETTING item=%d dock=%d raise=%d night=%d bright=%u vib=%d sound=%u", static_cast<int>(item),
-                     s_set.dock, s_set.raise, s_set.night, brightness_pct(), s_set.vibration, s_set.sound);
+            ESP_LOGI(kTag, "SETTING item=%d dock=%d raise=%d night=%d bright=%u vib=%d sound=%u left=%d",
+                     static_cast<int>(item), s_set.dock, s_set.raise, s_set.night, brightness_pct(), s_set.vibration,
+                     s_set.sound, s_set.left);
             if (!power_off) redraw_settings();
         };
         auto stop_alarm = [&]() {
