@@ -1603,9 +1603,15 @@ void draw_settings(lgfx::LovyanGFX* gfx, const SettingsView& view, DirtyRows* di
 SettingItem setting_at(int page, int x, int y)
 {
     if (x < kCenterX - kRowW / 2 - 10 || x > kCenterX + kRowW / 2 + 10) return SettingItem::none;
-    const int r = (y - kRowTop + kRowGap / 2) / (kRowH + kRowGap);
-    if (y < kRowTop - kRowGap / 2 || r < 0 || r >= kSettingsRows) return SettingItem::none;
-    return kSettingsLayout[page % kSettingsPages][r];
+    // 一番上と一番下の行は、行の外側を少し触っても入れる（2026-11-23 実機: 明るさの行の下の y=380〜397 を何度も触っていた）
+    if (y < kRowTop - 24 || y > kRowTop + kSettingsRows * (kRowH + kRowGap) + 24) return SettingItem::none;
+    const int r = std::min(kSettingsRows - 1, std::max(0, (y - kRowTop + kRowGap / 2) / (kRowH + kRowGap)));
+    SettingItem item = kSettingsLayout[page % kSettingsPages][r];
+    // 行が少ないページでは、最後の行の下も最後の行とみなす
+    for (int k = r; item == SettingItem::none && k > 0 && y < kRowTop + (k - 1) * (kRowH + kRowGap) + kRowH + 40; --k) {
+        item = kSettingsLayout[page % kSettingsPages][k - 1];
+    }
+    return item;
 }
 
 // タッチした位置と、触れている指の数を読む（CST820。0x02 = 指の数、0x03〜0x06 = X と Y の 12bit）。
