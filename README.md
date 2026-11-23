@@ -17,7 +17,7 @@ M5Stack StopWatch を Apple Watch の代わりに毎日着ける腕時計にす�
 - 充電スタンドに立てている間は、暗めの置き時計になります。
 - 1 時間ごとに電池の電圧、復帰した回数、点灯した時間を記録し、何に電力を使ったかを後から調べられます（`apps/watch/tools/battery_report.py`）。
 
-![画面](docs/images/screens.jpg)
+![画面（左から時計、ストップウォッチ、タイマー、設定）](docs/images/screens.jpg)
 
 電池（450mAh）は普段使いで平均 13〜18mA 前後を使い（実測）、1 日強もちます。目標の 2 日にはまだ届いていません。
 
