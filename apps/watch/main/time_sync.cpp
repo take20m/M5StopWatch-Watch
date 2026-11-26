@@ -25,6 +25,19 @@
 namespace watch {
 namespace {
 
+struct Network {
+    const char* ssid;
+    const char* password;
+};
+
+// 複数の Wi-Fi は WATCH_WIFI_NETWORKS で登録する。なければ WATCH_WIFI_SSID の 1 つだけ。
+#ifdef WATCH_WIFI_NETWORKS
+constexpr Network kNetworks[] = WATCH_WIFI_NETWORKS;
+#else
+constexpr Network kNetworks[] = {{WATCH_WIFI_SSID, WATCH_WIFI_PASSWORD}};
+#endif
+constexpr int kNetworkCount = static_cast<int>(sizeof(kNetworks) / sizeof(kNetworks[0]));
+
 constexpr char kTag[]            = "time_sync";
 constexpr char kNtpServer[]      = "ntp.nict.jp";
 constexpr int kConnectTimeoutMs  = 10000;
@@ -32,13 +45,12 @@ constexpr int kSntpTimeoutMs     = 10000;
 constexpr EventBits_t kGotIp     = BIT0;
 
 EventGroupHandle_t s_events = nullptr;
+volatile bool s_connecting  = false;
 
 void on_event(void*, esp_event_base_t base, int32_t id, void*)
 {
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        esp_wifi_connect();  // タイムアウトまで繰り返す
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_connecting) esp_wifi_connect();  // タイムアウトまで繰り返す
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         xEventGroupSetBits(s_events, kGotIp);
     }
@@ -65,8 +77,43 @@ std::int64_t epoch_from_tm(const std::tm& t)
 
 bool wifi_time_sync_configured()
 {
-    return std::strlen(WATCH_WIFI_SSID) > 0;
+    for (const Network& n : kNetworks) {
+        if (n.ssid != nullptr && n.ssid[0] != '\0') return true;
+    }
+    return false;
 }
+
+namespace {
+
+// つなぐ先を選ぶ。1 つだけならそれ。複数なら周りを探し、登録済みで一番電波の強いもの。見つからなければ -1。
+int pick_network()
+{
+    if (kNetworkCount == 1) return 0;
+    wifi_scan_config_t scan = {};
+    if (esp_wifi_scan_start(&scan, true) != ESP_OK) return -1;
+    std::uint16_t count = 0;
+    esp_wifi_scan_get_ap_num(&count);
+    constexpr std::uint16_t kMaxAps = 20;
+    static wifi_ap_record_t aps[kMaxAps];  // 1 件 80 バイトほどあるので、タスクのスタックに置かない
+    std::uint16_t n = count < kMaxAps ? count : kMaxAps;
+    if (esp_wifi_scan_get_ap_records(&n, aps) != ESP_OK) n = 0;
+    esp_wifi_clear_ap_list();  // 取り切れなかった分を捨てる
+    int best = -1, best_rssi = -1000;
+    for (std::uint16_t i = 0; i < n; ++i) {  // 電波の強い順に並んでいる
+        for (int k = 0; k < kNetworkCount; ++k) {
+            if (kNetworks[k].ssid[0] == '\0') continue;
+            if (std::strcmp(reinterpret_cast<const char*>(aps[i].ssid), kNetworks[k].ssid) != 0) continue;
+            if (aps[i].rssi > best_rssi) {
+                best      = k;
+                best_rssi = aps[i].rssi;
+            }
+        }
+    }
+    ESP_LOGI(kTag, "Wi-Fi scan aps=%u pick=%d rssi=%d", static_cast<unsigned>(count), best, best >= 0 ? best_rssi : 0);
+    return best;
+}
+
+}  // namespace
 
 esp_err_t wifi_time_sync(m5sw::wakeup::RtcWakeup* rtc, std::int64_t* synced_epoch, std::int64_t* drift_s)
 {
@@ -96,13 +143,26 @@ esp_err_t wifi_time_sync(m5sw::wakeup::RtcWakeup* rtc, std::int64_t* synced_epoc
     if (err == ESP_OK) {
         esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, on_event, nullptr, &wifi_handler);
         esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_event, nullptr, &ip_handler);
-        wifi_config_t config = {};
-        std::strncpy(reinterpret_cast<char*>(config.sta.ssid), WATCH_WIFI_SSID, sizeof(config.sta.ssid));
-        std::strncpy(reinterpret_cast<char*>(config.sta.password), WATCH_WIFI_PASSWORD, sizeof(config.sta.password));
         esp_wifi_set_storage(WIFI_STORAGE_RAM);
         err = esp_wifi_set_mode(WIFI_MODE_STA);
-        if (err == ESP_OK) err = esp_wifi_set_config(WIFI_IF_STA, &config);
         if (err == ESP_OK) err = esp_wifi_start();
+    }
+    if (err == ESP_OK) {
+        const int pick = pick_network();
+        if (pick < 0) {
+            err = ESP_ERR_NOT_FOUND;
+            ESP_LOGW(kTag, "Wi-Fi no known network nearby");
+        } else {
+            wifi_config_t config = {};
+            std::strncpy(reinterpret_cast<char*>(config.sta.ssid), kNetworks[pick].ssid, sizeof(config.sta.ssid));
+            std::strncpy(reinterpret_cast<char*>(config.sta.password), kNetworks[pick].password,
+                         sizeof(config.sta.password));
+            err = esp_wifi_set_config(WIFI_IF_STA, &config);
+            if (err == ESP_OK) {
+                s_connecting = true;
+                err          = esp_wifi_connect();
+            }
+        }
     }
 
     if (err == ESP_OK) {
@@ -135,6 +195,7 @@ esp_err_t wifi_time_sync(m5sw::wakeup::RtcWakeup* rtc, std::int64_t* synced_epoc
         esp_netif_sntp_deinit();
     }
 
+    s_connecting = false;
     esp_wifi_stop();
     if (wifi_handler) esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_handler);
     if (ip_handler) esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, ip_handler);
