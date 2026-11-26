@@ -154,9 +154,11 @@ esp_err_t wifi_time_sync(m5sw::wakeup::RtcWakeup* rtc, std::int64_t* synced_epoc
             ESP_LOGW(kTag, "Wi-Fi no known network nearby");
         } else {
             wifi_config_t config = {};
-            std::strncpy(reinterpret_cast<char*>(config.sta.ssid), kNetworks[pick].ssid, sizeof(config.sta.ssid));
-            std::strncpy(reinterpret_cast<char*>(config.sta.password), kNetworks[pick].password,
-                         sizeof(config.sta.password));
+            // SSID（32 バイト）とパスワード（64 バイト）は、ちょうどの長さなら終端の NUL なしで入れる決まり。
+            const char* ssid = kNetworks[pick].ssid;
+            const char* pass = kNetworks[pick].password;
+            std::memcpy(config.sta.ssid, ssid, strnlen(ssid, sizeof(config.sta.ssid)));
+            std::memcpy(config.sta.password, pass, strnlen(pass, sizeof(config.sta.password)));
             err = esp_wifi_set_config(WIFI_IF_STA, &config);
             if (err == ESP_OK) {
                 s_connecting = true;
