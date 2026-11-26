@@ -430,10 +430,21 @@ void battery_append(const BatteryRecord& rec);
 
 // 1 時間ごとの用事。起きた理由によらず、前回から 1 時間たっていればする（腕を動かしている間は定期起床が来ないため）。
 // 読んだ時刻（UNIX 秒）を返す。読めなければ 0。呼び出し側は夜の判定にも使う（RTC を 2 回読まない）。
+std::int64_t rc_now_us();
+RTC_DATA_ATTR std::int64_t s_next_lost_try_rc_us = 0;  // 時刻が読めないとき、次に Wi-Fi で合わせにいく時刻（内蔵タイマー）
+
 std::int64_t hourly_tasks(m5sw::wakeup::RtcWakeup* rtc, m5sw::power::PowerController* power)
 {
     std::tm utc = {};
-    if (!rtc->read_time(&utc).ok()) return 0;
+    if (!rtc->read_time(&utc).ok()) {
+        // 電池が切れて RTC の時刻が消えたときなど。時刻で予定を立てられないので、内蔵タイマーで 1 時間ごとに試す。
+        const std::int64_t rc = rc_now_us();
+        if (rc < s_next_lost_try_rc_us) return 0;
+        s_next_lost_try_rc_us = rc + 3600LL * 1000000;
+        if (maybe_wifi_time_sync(rtc, true) != ESP_OK) return 0;
+        if (!rtc->read_time(&utc).ok()) return 0;
+    }
+    s_next_lost_try_rc_us = 0;
     const std::int64_t now = epoch_from_utc(utc);
     if (s_next_record_epoch == 0 || now >= s_next_record_epoch) {
         s_next_record_epoch = now + kRecordEveryS;
@@ -2410,6 +2421,7 @@ extern "C" void app_main(void)
         (void)sync_time_from_usb(&rtc);
         show_watch(&fifo, ShowMode::cold_boot);
         maybe_wifi_time_sync(&rtc, true);  // コールドブートでは毎回試す（表示の後。Wi-Fi の動作確認を兼ねる）
+        s_next_lost_try_rc_us = rc_now_us() + 3600LL * 1000000;  // 失敗しても、続けてもう一度試さない
     } else if (timer_due()) {
         // タイマーの時間になった（寝る前に、終わる時刻でタイマー起床を仕掛けてある）
         ++s_wake_count;
